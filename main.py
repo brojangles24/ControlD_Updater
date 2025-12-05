@@ -47,7 +47,7 @@ FOLDER_URLS = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-microsoft-folder.json",
 ]
 
-BATCH_SIZE = 200
+BATCH_SIZE = 500
 MAX_RETRIES = 3
 # Limit concurrent operations to prevent API abuse/rate limits
 CONCURRENCY_LIMIT = 5 
