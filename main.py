@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Control D Sync (Genius Edition)
--------------------------------
-1. Auto-discovers ALL profiles (skipping excluded ones).
-2. Fetches HageZi blocklists from GitHub.
-3. Performs "Nuclear Sync": Deletes old folder, creates new one, pushes rules.
-4. "Smart Fallback": If a batch fails (due to duplicates), it retries rules 1-by-1.
+Control D Sync (Async Genius Edition)
+-------------------------------------
+1. Async/Await for maximum speed.
+2. Parallels profile syncing.
+3. Smart Fallback for duplicate rules (Batch -> 1-by-1).
+4. Auto-discovery & Exclusion logic.
 """
 
 import os
 import logging
-import time
-from typing import Dict, List, Optional, Any, Set
+import asyncio
+from typing import Dict, List, Any, Set
 
 import httpx
-# Handle dotenv for local dev vs GitHub Actions
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -35,7 +34,7 @@ log = logging.getLogger("control-d-sync")
 API_BASE = "https://api.controld.com"
 TOKEN = os.getenv("TOKEN")
 
-# HageZi Blocklists
+# USER DEFINED URLS
 FOLDER_URLS = [
     # --- Aggressive Security ---
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json",
@@ -48,40 +47,28 @@ FOLDER_URLS = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-microsoft-folder.json",
 ]
 
-BATCH_SIZE = 200  # Safe limit for Control D API
+BATCH_SIZE = 200
 MAX_RETRIES = 3
-RETRY_DELAY = 1
+# Limit concurrent operations to prevent API abuse/rate limits
+CONCURRENCY_LIMIT = 5 
 
 # --------------------------------------------------------------------------- #
-# 1. Clients & Helpers
+# 1. Async Clients & Helpers
 # --------------------------------------------------------------------------- #
 
-# Auth Client (For Control D)
-_api = httpx.Client(
-    headers={"Accept": "application/json", "Authorization": f"Bearer {TOKEN}"},
-    timeout=30,
-)
-
-# Clean Client (For GitHub - No Headers)
-_gh = httpx.Client(timeout=30)
-
-_cache: Dict[str, Dict] = {}
-
-def _retry_request(request_func):
-    """Retries a request with exponential backoff."""
+async def _retry_request(request_func):
+    """Async retry logic."""
     for attempt in range(MAX_RETRIES):
         try:
-            response = request_func()
-            # Special handling: 400 errors are business logic errors (duplicates), 
-            # we want to raise them immediately so logic can handle them, 
-            # NOT retry the exact same bad request 3 times.
+            response = await request_func()
+            # If 400 (Bad Request), raise immediately so business logic handles it
             if response.status_code == 400:
                 response.raise_for_status()
             
             response.raise_for_status()
             return response
         except (httpx.HTTPError, httpx.TimeoutException) as e:
-            # If it's a 400, stop retrying and let the caller handle it
+            # If it's a 400, stop retrying and let the caller handle it (Smart Fallback)
             if hasattr(e, 'response') and e.response is not None and e.response.status_code == 400:
                 raise
                 
@@ -89,35 +76,17 @@ def _retry_request(request_func):
                 if hasattr(e, 'response') and e.response is not None:
                     log.error(f"❌ API Error: {e.response.text}")
                 raise
-            time.sleep(RETRY_DELAY * (2 ** attempt))
+            await asyncio.sleep(1 * (2 ** attempt))
 
-def _api_get(endpoint: str) -> httpx.Response:
-    return _retry_request(lambda: _api.get(f"{API_BASE}{endpoint}"))
+async def fetch_gh_json(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
+    resp = await client.get(url)
+    resp.raise_for_status()
+    return resp.json()
 
-def _api_delete(endpoint: str) -> httpx.Response:
-    return _retry_request(lambda: _api.delete(f"{API_BASE}{endpoint}"))
-
-def _api_post(endpoint: str, data: Dict) -> httpx.Response:
-    return _retry_request(lambda: _api.post(f"{API_BASE}{endpoint}", data=data))
-
-def _api_post_form(endpoint: str, data: Dict) -> httpx.Response:
-    return _retry_request(lambda: _api.post(f"{API_BASE}{endpoint}", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}))
-
-def fetch_gh_json(url: str) -> Dict[str, Any]:
-    if url not in _cache:
-        r = _gh.get(url)
-        r.raise_for_status()
-        _cache[url] = r.json()
-    return _cache[url]
-
-# --------------------------------------------------------------------------- #
-# 2. Logic
-# --------------------------------------------------------------------------- #
-
-def get_all_profiles() -> List[str]:
-    """Auto-discover all profiles on the account."""
+async def get_all_profiles(client: httpx.AsyncClient) -> List[str]:
     try:
-        data = _api_get("/profiles").json()
+        resp = await _retry_request(lambda: client.get(f"{API_BASE}/profiles"))
+        data = resp.json()
         profiles = [p["PK"] for p in data.get("body", {}).get("profiles", [])]
         log.info(f"🔎 Auto-discovered {len(profiles)} profiles.")
         return profiles
@@ -125,22 +94,20 @@ def get_all_profiles() -> List[str]:
         log.error(f"Failed to auto-discover profiles: {e}")
         return []
 
-def list_folders(profile_id: str) -> Dict[str, str]:
+async def list_folders(client: httpx.AsyncClient, profile_id: str) -> Dict[str, str]:
     try:
-        data = _api_get(f"/profiles/{profile_id}/groups").json()
+        resp = await _retry_request(lambda: client.get(f"{API_BASE}/profiles/{profile_id}/groups"))
+        data = resp.json()
         return {g["group"].strip(): g["PK"] for g in data.get("body", {}).get("groups", [])}
     except Exception:
         return {}
 
-def push_rules(profile_id, folder_name, folder_id, do, status, hostnames):
-    """
-    Pushes rules in batches. 
-    If a batch fails (usually due to a duplicate rule existing elsewhere), 
-    it falls back to pushing that batch 1-by-1 to ensure non-duplicates still get added.
-    """
-    # Track what we've added in this run to avoid sending duplicates within the same list
-    existing_rules = set() 
-    
+# --------------------------------------------------------------------------- #
+# 2. Async Logic
+# --------------------------------------------------------------------------- #
+
+async def push_rules(client: httpx.AsyncClient, profile_id, folder_name, folder_id, do, status, hostnames):
+    existing_rules = set()
     batches = [hostnames[i:i + BATCH_SIZE] for i in range(0, len(hostnames), BATCH_SIZE)]
     total = len(batches)
     
@@ -149,117 +116,132 @@ def push_rules(profile_id, folder_name, folder_id, do, status, hostnames):
         if not to_push: continue
 
         data = {"do": str(do), "status": str(status), "group": str(folder_id)}
-        
-        # Prepare batch data
         batch_data = data.copy()
         for j, h in enumerate(to_push):
             batch_data[f"hostnames[{j}]"] = h
             
         try:
             # 1. Try pushing the whole batch
-            _api_post_form(f"/profiles/{profile_id}/rules", batch_data)
-            log.info(f"   └─ Batch {i}/{total}: Pushed {len(to_push)} rules.")
+            await _retry_request(lambda: client.post(
+                f"{API_BASE}/profiles/{profile_id}/rules", 
+                data=batch_data, 
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            ))
+            log.info(f"   └─ [{folder_name}] Batch {i}/{total}: Pushed {len(to_push)} rules.")
             existing_rules.update(to_push)
             
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 400:
-                # 2. BATCH FAILED - Smart Fallback
-                log.warning(f"   ⚠️ Batch {i}/{total} hit a conflict (Duplicate). Retrying individually...")
-                
+                # 2. BATCH FAILED - Smart Fallback (1-by-1)
+                log.warning(f"   ⚠️ [{folder_name}] Batch {i}/{total} hit conflict. Retrying individually...")
                 success_count = 0
+                
                 for h in to_push:
                     single_data = data.copy()
                     single_data["hostnames[0]"] = h
                     try:
-                        _api_post_form(f"/profiles/{profile_id}/rules", single_data)
+                        await client.post(
+                            f"{API_BASE}/profiles/{profile_id}/rules", 
+                            data=single_data,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"}
+                        )
                         success_count += 1
                         existing_rules.add(h)
                     except Exception:
                         # Ignore duplicates on individual push
                         pass
-                
-                log.info(f"   └─ Batch {i}/{total} (Recovered): Pushed {success_count}/{len(to_push)} rules.")
+                log.info(f"   └─ [{folder_name}] Recovered: {success_count}/{len(to_push)} rules.")
             else:
-                log.error(f"   ❌ Batch {i} failed with unexpected error: {e}")
+                log.error(f"   ❌ [{folder_name}] Batch {i} failed: {e}")
 
-        except Exception as e:
-            log.error(f"   ❌ Batch {i} failed: {e}")
+async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncClient, gh_client: httpx.AsyncClient, profile_id: str, remote_data: List[Dict]):
+    async with sem:
+        log.info(f"--- Syncing Profile: {profile_id} ---")
+        
+        # Get Current Folders
+        current_folders = await list_folders(auth_client, profile_id)
 
-def sync_profile(profile_id: str):
-    log.info(f"--- Syncing Profile: {profile_id} ---")
-    
-    # 1. Fetch Remote Data
-    targets = []
-    for url in FOLDER_URLS:
-        try:
-            targets.append(fetch_gh_json(url))
-        except Exception as e:
-            log.error(f"Skipping list {url}: {e}")
+        for remote in remote_data:
+            name = remote["group"]["group"].strip()
+            do_action = remote["group"]["action"]["do"]
+            status = remote["group"]["action"]["status"]
+            rules = [r["PK"] for r in remote.get("rules", []) if r.get("PK")]
 
-    # 2. Get Current Folders
-    current_folders = list_folders(profile_id)
+            # Nuclear Delete
+            if name in current_folders:
+                log.info(f"🗑️  [{profile_id}] Deleting '{name}'...")
+                try:
+                    await _retry_request(lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[name]}"))
+                except Exception as e:
+                    log.error(f"Failed to delete {name}: {e}")
 
-    # 3. Process Each List
-    for remote in targets:
-        name = remote["group"]["group"].strip()
-        do_action = remote["group"]["action"]["do"]
-        status = remote["group"]["action"]["status"]
-        rules = [r["PK"] for r in remote.get("rules", []) if r.get("PK")]
-
-        # Nuclear: Delete if exists
-        if name in current_folders:
-            log.info(f"🗑️  Deleting old '{name}'...")
+            # Create New
+            log.info(f"✨ [{profile_id}] Creating '{name}'...")
             try:
-                _api_delete(f"/profiles/{profile_id}/groups/{current_folders[name]}")
+                await _retry_request(lambda: auth_client.post(
+                    f"{API_BASE}/profiles/{profile_id}/groups", 
+                    data={"name": name, "do": do_action, "status": status}
+                ))
+                
+                # Wait briefly for consistency
+                await asyncio.sleep(1)
+                
+                new_folders = await list_folders(auth_client, profile_id)
+                new_id = new_folders.get(name)
+                
+                if new_id:
+                    await push_rules(auth_client, profile_id, name, new_id, do_action, status, rules)
+                else:
+                    log.error(f"Could not find new folder ID for {name}")
+
             except Exception as e:
-                log.error(f"Failed to delete {name}: {e}")
+                log.error(f"Failed to create/sync {name}: {e}")
 
-        # Create New
-        log.info(f"✨ Creating '{name}'...")
-        try:
-            _api_post(f"/profiles/{profile_id}/groups", data={"name": name, "do": do_action, "status": status})
-            
-            # Re-fetch list to get the new ID reliably
-            time.sleep(1) 
-            new_folders = list_folders(profile_id)
-            new_id = new_folders.get(name)
-            
-            if new_id:
-                push_rules(profile_id, name, new_id, do_action, status, rules)
-            else:
-                log.error(f"Could not find new folder ID for {name}")
-
-        except Exception as e:
-            log.error(f"Failed to create/sync {name}: {e}")
-
-# --------------------------------------------------------------------------- #
-# 3. Main
-# --------------------------------------------------------------------------- #
-def main():
+async def main_async():
     if not TOKEN:
         log.error("Missing TOKEN env var.")
-        exit(1)
+        return
 
-    # --- EXCLUSION LIST ---
+    # --- CONFIG: EXCLUSIONS ---
     EXCLUDED_PROFILES = ["780037lax6zo"]
-    # ----------------------
+    # --------------------------
 
-    # Check for specific profile arg, otherwise auto-discover
-    env_profiles = os.getenv("PROFILE", "").strip()
-    if env_profiles:
-        pids = [p.strip() for p in env_profiles.split(",") if p.strip()]
-    else:
-        pids = get_all_profiles()
+    # Initialize Clients
+    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60) as auth_client, \
+               httpx.AsyncClient(timeout=60) as gh_client:
+        
+        # 1. Fetch Remote Blocklists (Parallel)
+        log.info("📥 Fetching blocklists from GitHub...")
+        gh_tasks = [fetch_gh_json(gh_client, url) for url in FOLDER_URLS]
+        remote_data = await asyncio.gather(*gh_tasks, return_exceptions=True)
+        valid_remote_data = [r for r in remote_data if isinstance(r, dict)]
 
-    # Filter Exclusions
-    pids = [p for p in pids if p not in EXCLUDED_PROFILES]
+        if not valid_remote_data:
+            log.error("No valid blocklists fetched.")
+            return
 
-    if not pids:
-        log.error("No profiles found to sync (or all were excluded).")
-        exit(1)
+        # 2. Discover Profiles
+        env_profiles = os.getenv("PROFILE", "").strip()
+        if env_profiles:
+            pids = [p.strip() for p in env_profiles.split(",") if p.strip()]
+        else:
+            pids = await get_all_profiles(auth_client)
 
-    for pid in pids:
-        sync_profile(pid)
+        # 3. Apply Exclusions
+        pids = [p for p in pids if p not in EXCLUDED_PROFILES]
+
+        if not pids:
+            log.error("No profiles found to sync.")
+            return
+
+        # 4. Sync Profiles (Concurrent with Semaphore)
+        sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        tasks = [sync_single_profile(sem, auth_client, gh_client, pid, valid_remote_data) for pid in pids]
+        
+        await asyncio.gather(*tasks)
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
