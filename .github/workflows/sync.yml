@@ -2,12 +2,15 @@ name: Control D Sync
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Run every 6 hours
-  workflow_dispatch:       # Allows manual trigger button
+    # Runs at 04:00 UTC every day
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    # Allows manual trigger from the Actions tab
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -15,17 +18,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Install dependencies
-        # Simple pip install - no virtualenv needed for Actions
         run: |
-          python -m pip install --upgrade pip
-          pip install httpx tqdm python-dotenv
+          pip install -r requirements.txt
 
-      - name: Run Sync
+      - name: Run Sync Script
         env:
+          # We map the GitHub Secret to the Python Env Var
           TOKEN: ${{ secrets.CONTROLD_TOKEN }}
-          # Leave PROFILE empty to auto-discover all profiles
-          PROFILE: ""
+          # Optional: Define PROFILE here if you only want specific ones.
+          # Leave commented out to auto-discover ALL profiles.
+          # PROFILE: "12345678,abcdefgh" 
         run: python main.py
