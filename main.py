@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Control D Sync (Auto-Discovery Edition)
----------------------------------------
-1. Auto-discovers ALL profiles if no specific ID is provided.
-2. Deletes old folders (Nuclear option).
-3. Re-creates folders and pushes rules in batches.
+Control D Sync (Genius Edition)
+-------------------------------
+1. Auto-discovers ALL profiles (skipping excluded ones).
+2. Fetches HageZi blocklists from GitHub.
+3. Performs "Nuclear Sync": Deletes old folder, creates new one, pushes rules.
+4. "Smart Fallback": If a batch fails (due to duplicates), it retries rules 1-by-1.
 """
 
 import os
@@ -13,7 +14,7 @@ import time
 from typing import Dict, List, Optional, Any, Set
 
 import httpx
-# We wrap dotenv in try/except so it runs in GitHub Actions (where .env might not exist)
+# Handle dotenv for local dev vs GitHub Actions
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -34,45 +35,57 @@ log = logging.getLogger("control-d-sync")
 API_BASE = "https://api.controld.com"
 TOKEN = os.getenv("TOKEN")
 
-# List of Hagezi Blocklists to Sync
+# HageZi Blocklists
 FOLDER_URLS = [
     # --- Aggressive Security ---
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-tlds-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-idns-folder.json",
     
-    # --- Native Trackers (Dots instead of dashes) ---
+    # --- Native Trackers ---
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-amazon-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-apple-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-microsoft-folder.json",
-    #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.tiktok-folder.json",
-    
-    # --- Allow Lists ---
-    #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-referral-folder.json",
-    #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-good-folder.json",
+
 ]
 
-BATCH_SIZE = 200 # Safe limit to avoid 400 Errors
+BATCH_SIZE = 200  # Safe limit for Control D API
 MAX_RETRIES = 3
 RETRY_DELAY = 1
 
 # --------------------------------------------------------------------------- #
 # 1. Clients & Helpers
 # --------------------------------------------------------------------------- #
+
+# Auth Client (For Control D)
 _api = httpx.Client(
     headers={"Accept": "application/json", "Authorization": f"Bearer {TOKEN}"},
     timeout=30,
 )
+
+# Clean Client (For GitHub - No Headers)
 _gh = httpx.Client(timeout=30)
+
 _cache: Dict[str, Dict] = {}
 
 def _retry_request(request_func):
+    """Retries a request with exponential backoff."""
     for attempt in range(MAX_RETRIES):
         try:
             response = request_func()
+            # Special handling: 400 errors are business logic errors (duplicates), 
+            # we want to raise them immediately so logic can handle them, 
+            # NOT retry the exact same bad request 3 times.
+            if response.status_code == 400:
+                response.raise_for_status()
+            
             response.raise_for_status()
             return response
         except (httpx.HTTPError, httpx.TimeoutException) as e:
+            # If it's a 400, stop retrying and let the caller handle it
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 400:
+                raise
+                
             if attempt == MAX_RETRIES - 1:
                 if hasattr(e, 'response') and e.response is not None:
                     log.error(f"❌ API Error: {e.response.text}")
@@ -121,28 +134,55 @@ def list_folders(profile_id: str) -> Dict[str, str]:
         return {}
 
 def push_rules(profile_id, folder_name, folder_id, do, status, hostnames):
-    # Retrieve existing rules to prevent duplicates (400 Bad Request)
-    # Note: In a pure nuclear rebuild of a fresh folder, this is empty, 
-    # but we keep it for safety if partial syncs occur.
+    """
+    Pushes rules in batches. 
+    If a batch fails (usually due to a duplicate rule existing elsewhere), 
+    it falls back to pushing that batch 1-by-1 to ensure non-duplicates still get added.
+    """
+    # Track what we've added in this run to avoid sending duplicates within the same list
     existing_rules = set() 
     
-    # Simple batching
     batches = [hostnames[i:i + BATCH_SIZE] for i in range(0, len(hostnames), BATCH_SIZE)]
     total = len(batches)
     
     for i, batch in enumerate(batches, 1):
-        # Filter duplicates (if any exist in the destination)
         to_push = [h for h in batch if h not in existing_rules]
         if not to_push: continue
 
         data = {"do": str(do), "status": str(status), "group": str(folder_id)}
+        
+        # Prepare batch data
+        batch_data = data.copy()
         for j, h in enumerate(to_push):
-            data[f"hostnames[{j}]"] = h
+            batch_data[f"hostnames[{j}]"] = h
             
         try:
-            _api_post_form(f"/profiles/{profile_id}/rules", data)
+            # 1. Try pushing the whole batch
+            _api_post_form(f"/profiles/{profile_id}/rules", batch_data)
             log.info(f"   └─ Batch {i}/{total}: Pushed {len(to_push)} rules.")
             existing_rules.update(to_push)
+            
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                # 2. BATCH FAILED - Smart Fallback
+                log.warning(f"   ⚠️ Batch {i}/{total} hit a conflict (Duplicate). Retrying individually...")
+                
+                success_count = 0
+                for h in to_push:
+                    single_data = data.copy()
+                    single_data["hostnames[0]"] = h
+                    try:
+                        _api_post_form(f"/profiles/{profile_id}/rules", single_data)
+                        success_count += 1
+                        existing_rules.add(h)
+                    except Exception:
+                        # Ignore duplicates on individual push
+                        pass
+                
+                log.info(f"   └─ Batch {i}/{total} (Recovered): Pushed {success_count}/{len(to_push)} rules.")
+            else:
+                log.error(f"   ❌ Batch {i} failed with unexpected error: {e}")
+
         except Exception as e:
             log.error(f"   ❌ Batch {i} failed: {e}")
 
@@ -178,12 +218,10 @@ def sync_profile(profile_id: str):
         # Create New
         log.info(f"✨ Creating '{name}'...")
         try:
-            cr = _api_post(f"/profiles/{profile_id}/groups", data={"name": name, "do": do_action, "status": status})
-            # The API returns the whole group list, we have to find our new ID
-            # But simpler is to just fetch the list again or parse the response if it contains the ID.
-            # Control D POST /groups response usually contains the created object or list.
-            # Let's re-fetch to be 100% safe and getting the right PK.
-            time.sleep(1) # Consistency delay
+            _api_post(f"/profiles/{profile_id}/groups", data={"name": name, "do": do_action, "status": status})
+            
+            # Re-fetch list to get the new ID reliably
+            time.sleep(1) 
             new_folders = list_folders(profile_id)
             new_id = new_folders.get(name)
             
@@ -203,6 +241,10 @@ def main():
         log.error("Missing TOKEN env var.")
         exit(1)
 
+    # --- EXCLUSION LIST ---
+    EXCLUDED_PROFILES = ["780037lax6zo"]
+    # ----------------------
+
     # Check for specific profile arg, otherwise auto-discover
     env_profiles = os.getenv("PROFILE", "").strip()
     if env_profiles:
@@ -210,8 +252,11 @@ def main():
     else:
         pids = get_all_profiles()
 
+    # Filter Exclusions
+    pids = [p for p in pids if p not in EXCLUDED_PROFILES]
+
     if not pids:
-        log.error("No profiles found to sync.")
+        log.error("No profiles found to sync (or all were excluded).")
         exit(1)
 
     for pid in pids:
