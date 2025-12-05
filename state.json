@@ -1,0 +1,26 @@
+{
+  "712995laxgov": {
+    "Amazon Tracker": "ff34d302d142c7c9cb54dcf7c024a9f5fab4284a105888dfa97084b760b69f44",
+    "Apple Tracker": "4918092804999ee5a360d692e85571eeb7f4aeceb658db1fef7a6457078bfd0c",
+    "Badware Hoster": "f737ea5c5f790c45444eec17a8aff4d15c4dfb8653a30b0d705c2a5685af7371",
+    "Microsoft Tracker": "41813c3a4d5f8dfbc6eb0eb69a067b51df8c55ca011a1055615339e62af9ae05",
+    "Spam IDNs": "eabc3718c9d936ce662e903c424ae60223d33e891b495a5f4976141d3dafa43b",
+    "Spam TLDs": "2670e40ef25489b101b79abc388c64141b77f61ca008521376e10ba0adadf98a"
+  },
+  "777699laxsyq": {
+    "Amazon Tracker": "ff34d302d142c7c9cb54dcf7c024a9f5fab4284a105888dfa97084b760b69f44",
+    "Apple Tracker": "4918092804999ee5a360d692e85571eeb7f4aeceb658db1fef7a6457078bfd0c",
+    "Badware Hoster": "f737ea5c5f790c45444eec17a8aff4d15c4dfb8653a30b0d705c2a5685af7371",
+    "Microsoft Tracker": "41813c3a4d5f8dfbc6eb0eb69a067b51df8c55ca011a1055615339e62af9ae05",
+    "Spam IDNs": "eabc3718c9d936ce662e903c424ae60223d33e891b495a5f4976141d3dafa43b",
+    "Spam TLDs": "2670e40ef25489b101b79abc388c64141b77f61ca008521376e10ba0adadf98a"
+  },
+  "777700lax4sk": {
+    "Amazon Tracker": "ff34d302d142c7c9cb54dcf7c024a9f5fab4284a105888dfa97084b760b69f44",
+    "Apple Tracker": "4918092804999ee5a360d692e85571eeb7f4aeceb658db1fef7a6457078bfd0c",
+    "Badware Hoster": "f737ea5c5f790c45444eec17a8aff4d15c4dfb8653a30b0d705c2a5685af7371",
+    "Microsoft Tracker": "41813c3a4d5f8dfbc6eb0eb69a067b51df8c55ca011a1055615339e62af9ae05",
+    "Spam IDNs": "eabc3718c9d936ce662e903c424ae60223d33e891b495a5f4976141d3dafa43b",
+    "Spam TLDs": "2670e40ef25489b101b79abc388c64141b77f61ca008521376e10ba0adadf98a"
+  }
+}
