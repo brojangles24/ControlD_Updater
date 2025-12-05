@@ -2,14 +2,15 @@ name: Control D Sync
 
 on:
   schedule:
-    # Runs at 04:00 UTC every day
     - cron: '0 4 * * *'
   workflow_dispatch:
-    # Allows manual trigger from the Actions tab
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      # Give the bot permission to write to the repo
+      contents: write
     
     steps:
       - name: Checkout code
@@ -22,13 +23,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install httpx python-dotenv
 
       - name: Run Sync Script
         env:
-          # We map the GitHub Secret to the Python Env Var
           TOKEN: ${{ secrets.CONTROLD_TOKEN }}
-          # Optional: Define PROFILE here if you only want specific ones.
-          # Leave commented out to auto-discover ALL profiles.
-          # PROFILE: "12345678,abcdefgh" 
         run: python main.py
+
+      - name: Commit and Push State
+        # Only run if state.json changed
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add state.json
+          # The command below will fail if there are no changes, which is fine (we ignore error with || echo)
+          git commit -m "Update sync state [skip ci]" || echo "No changes to commit"
+          git push
