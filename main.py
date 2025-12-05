@@ -55,7 +55,7 @@ FOLDER_URLS = [
 
 BATCH_SIZE = 200
 MAX_RETRIES = 3
-SURGICAL_THRESHOLD = 200 
+SURGICAL_THRESHOLD = 1 
 CONCURRENCY_LIMIT = 5
 
 # --------------------------------------------------------------------------- #
