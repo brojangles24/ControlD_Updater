@@ -38,21 +38,19 @@ PROFILE_IDS = [p.strip() for p in os.getenv("PROFILE", "").split(",") if p.strip
 # CORRECTED URLs (Based on Hagezi's new short naming convention)
 FOLDER_URLS = [
     # --- Aggressive Security ---
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/badware-hoster-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/tlds-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/idns-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-tlds-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-idns-folder.json",
     
     # --- Native Trackers (Dots instead of dashes) ---
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.amazon-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.apple-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.microsoft-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-amazon-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-apple-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-microsoft-folder.json",
     #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.tiktok-folder.json",
     
     # --- Allow Lists ---
-   '''
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-referral-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-good-folder.json",
-   '''
+    #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-referral-folder.json",
+    #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-good-folder.json",
 ]
 
 BATCH_SIZE = 1000
