@@ -53,7 +53,7 @@ FOLDER_URLS = [
     #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-good-folder.json",
 ]
 
-BATCH_SIZE = 1000
+BATCH_SIZE = 200
 MAX_RETRIES = 3
 SURGICAL_THRESHOLD = 200 
 CONCURRENCY_LIMIT = 5
@@ -67,13 +67,19 @@ async def _api(client: httpx.AsyncClient, method: str, endpoint: str, **kwargs) 
     for i in range(MAX_RETRIES):
         try:
             resp = await client.request(method, url, **kwargs)
+            # If we get a 400/500 error, print the message BEFORE raising the crash
+            if resp.is_error:
+                log.error(f"⚠️ API Error [{resp.status_code}]: {resp.text}")
+            
             resp.raise_for_status()
             return resp
-        except (httpx.HTTPError, httpx.TimeoutException):
-            if i == MAX_RETRIES - 1: raise
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            if i == MAX_RETRIES - 1:
+                log.error(f"🔥 Final failure on {endpoint}: {e}")
+                raise
             await asyncio.sleep(0.5 * (2 ** i))
     return None
-
+   
 async def fetch_json(client: httpx.AsyncClient, url: str) -> Optional[Dict]:
     try:
         resp = await client.get(url)
