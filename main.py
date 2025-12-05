@@ -2,7 +2,6 @@
 """
 Control D Sync (Genius Edition)
 -------------------------------
-The ultimate state-machine for Control D.
 1. Fetches Remote & Local state in parallel.
 2. Calculates exact 'Delta' (Additions/Deletions).
 3. Uses Heuristics to choose strategy:
@@ -14,7 +13,7 @@ The ultimate state-machine for Control D.
 import os
 import logging
 import asyncio
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set
 
 import httpx
 from dotenv import load_dotenv
@@ -36,30 +35,30 @@ API_BASE = "https://api.controld.com"
 TOKEN = os.getenv("TOKEN")
 PROFILE_IDS = [p.strip() for p in os.getenv("PROFILE", "").split(",") if p.strip()]
 
+# CORRECTED URLs (Based on Hagezi's new short naming convention)
 FOLDER_URLS = [
     # --- Aggressive Security ---
-    # Renamed from 'badware-hoster' to 'hoster'
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/hoster-folder.json",
-    
-    # Renamed from 'spam-tlds' to 'tlds'
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/badware-hoster-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/tlds-folder.json",
-    
-    # Renamed from 'spam-idns' to 'idns' (International Domain Names / Fake Text)
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/idns-folder.json",
     
-    # --- Native Trackers (Renamed: Dots instead of dashes) ---
+    # --- Native Trackers (Dots instead of dashes) ---
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.amazon-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.apple-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.microsoft-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.tiktok-folder.json",
+    #"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native.tiktok-folder.json",
+    
+    # --- Allow Lists ---
+   '''
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-referral-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/whitelist-good-folder.json",
+   '''
 ]
 
 BATCH_SIZE = 1000
 MAX_RETRIES = 3
-# The "Tipping Point": If we have to delete more than this many rules, 
-# it's faster to nuke the whole folder than to delete them one by one.
 SURGICAL_THRESHOLD = 200 
-CONCURRENCY_LIMIT = 10
+CONCURRENCY_LIMIT = 5
 
 # --------------------------------------------------------------------------- #
 # 1. Network Core
@@ -91,10 +90,6 @@ async def fetch_json(client: httpx.AsyncClient, url: str) -> Optional[Dict]:
 # --------------------------------------------------------------------------- #
 
 async def get_profile_tree(client: httpx.AsyncClient, profile_id: str) -> Dict[str, Any]:
-    """
-    Returns: { "FolderName": { "id": "grp_123", "rules": {"example.com": "rule_abc123"} } }
-    We map Hostname -> RuleID so we can surgically delete specific rules later.
-    """
     groups_resp = await _api(client, "GET", f"/profiles/{profile_id}/groups")
     groups = groups_resp.json().get("body", {}).get("groups", [])
     
@@ -108,7 +103,7 @@ async def get_profile_tree(client: httpx.AsyncClient, profile_id: str) -> Dict[s
         rules_resp = await _api(client, "GET", f"/profiles/{profile_id}/rules/{pk}")
         rules_data = rules_resp.json().get("body", {}).get("rules", [])
         
-        # Map Hostname -> PK (Crucial for Delta Sync)
+        # Map Hostname -> PK
         rule_dict = {r["PK"]: r["key"] for r in rules_data if r.get("PK") and r.get("key")}
         return name, {"id": pk, "rules": rule_dict}
 
@@ -122,12 +117,11 @@ async def get_profile_tree(client: httpx.AsyncClient, profile_id: str) -> Dict[s
     return folder_map
 
 # --------------------------------------------------------------------------- #
-# 3. Operations (Surgical vs Nuclear)
+# 3. Operations
 # --------------------------------------------------------------------------- #
 
 async def op_nuclear_rebuild(client, pid, name, meta, hostnames, old_id):
-    """The 'Sledgehammer': Delete folder, create new, push all."""
-    log.info(f"☢️  [{name}] NUCLEAR REBUILD (Faster for massive changes)")
+    """Delete old folder, create new, push all."""
     if old_id:
         await _api(client, "DELETE", f"/profiles/{pid}/groups/{old_id}")
     
@@ -135,7 +129,6 @@ async def op_nuclear_rebuild(client, pid, name, meta, hostnames, old_id):
     cr = await _api(client, "POST", f"/profiles/{pid}/groups", 
                     json={"name": name, "do": meta["do"], "status": meta["status"]})
     
-    # Verify ID (Handling API race conditions)
     new_id = cr.json().get("body", {}).get("groups", [{}])[0].get("PK")
     if not new_id:
         await asyncio.sleep(1)
@@ -151,31 +144,26 @@ async def op_nuclear_rebuild(client, pid, name, meta, hostnames, old_id):
     for batch in batches:
         data = {"do": str(meta["do"]), "status": str(meta["status"]), "group": str(new_id)}
         for j, h in enumerate(batch): data[f"hostnames[{j}]"] = h
-        
-        # Async push batches (We don't need to wait for order)
         tasks.append(_api(client, "POST", f"/profiles/{pid}/rules", data=data))
     
     await asyncio.gather(*tasks)
 
 async def op_surgical_patch(client, pid, name, folder_id, meta, to_add, to_delete, rule_map):
-    """The 'Scalpel': Add specific domains, Delete specific IDs."""
-    log.info(f"🩺 [{name}] SURGICAL PATCH (+{len(to_add)} / -{len(to_delete)})")
+    """Add missing, remove extra."""
     
-    # 1. Deletions (Must happen individually or in small parallel bursts)
+    # 1. Deletions
     if to_delete:
         async def delete_one(hostname):
             rule_id = rule_map.get(hostname)
             if rule_id:
                 await _api(client, "DELETE", f"/profiles/{pid}/rules/{rule_id}")
 
-        # Limit concurrency for deletions so we don't 429
         sem = asyncio.Semaphore(10)
         async def safe_delete(h):
             async with sem: await delete_one(h)
-            
         await asyncio.gather(*[safe_delete(h) for h in to_delete])
 
-    # 2. Additions (Can be batched)
+    # 2. Additions
     if to_add:
         batches = [list(to_add)[i:i + BATCH_SIZE] for i in range(0, len(to_add), BATCH_SIZE)]
         tasks = []
@@ -186,13 +174,11 @@ async def op_surgical_patch(client, pid, name, folder_id, meta, to_add, to_delet
         await asyncio.gather(*tasks)
 
 # --------------------------------------------------------------------------- #
-# 4. The Brain
+# 4. Main
 # --------------------------------------------------------------------------- #
 
 async def sync_profile(client: httpx.AsyncClient, profile_id: str, remote_data: List[Dict]):
-    log.info(f"--- Analyzing Profile: {profile_id} ---")
-    
-    # Fetch current state (Map of Hostnames -> RuleIDs)
+    log.info(f"--- Syncing Profile: {profile_id} ---")
     current_state = await get_profile_tree(client, profile_id)
     
     tasks = []
@@ -204,38 +190,31 @@ async def sync_profile(client: httpx.AsyncClient, profile_id: str, remote_data: 
         
         remote_hosts = set([r["PK"] for r in remote.get("rules", []) if r.get("PK")])
         
-        # Default: Nuclear if folder missing
-        strategy = "nuclear"
-        curr_hosts = set()
         folder_id = None
+        curr_hosts = set()
         rule_map = {}
-        
+        strategy = "nuclear"
+
         if name in current_state:
-            folder_data = current_state[name]
-            folder_id = folder_data["id"]
-            rule_map = folder_data["rules"] # dict {hostname: rule_pk}
+            folder_id = current_state[name]["id"]
+            rule_map = current_state[name]["rules"]
             curr_hosts = set(rule_map.keys())
             
-            # --- The Genius Calculation ---
             if remote_hosts == curr_hosts:
-                log.info(f"✅ [{name}] Perfectly synced. Skipping.")
+                log.info(f"✅ [{name}] Synced.")
                 continue
                 
             to_add = remote_hosts - curr_hosts
             to_delete = curr_hosts - remote_hosts
             
-            # Cost Analysis
-            # If we have to delete too many individual rules, the API gets slow.
-            # Nuclear is O(1) delete + O(N) write. Surgical is O(N) delete + O(N) write.
-            if len(to_delete) > SURGICAL_THRESHOLD:
-                strategy = "nuclear"
-            else:
+            if len(to_delete) <= SURGICAL_THRESHOLD:
                 strategy = "surgical"
+            else:
+                strategy = "nuclear"
         else:
             to_add = remote_hosts
             to_delete = set()
 
-        # Enqueue the work
         if strategy == "nuclear":
             tasks.append(op_nuclear_rebuild(client, profile_id, name, {"do": do, "status": status}, list(remote_hosts), folder_id))
         else:
@@ -244,27 +223,24 @@ async def sync_profile(client: httpx.AsyncClient, profile_id: str, remote_data: 
     if tasks:
         await asyncio.gather(*tasks)
     else:
-        log.info(f"🎉 Profile {profile_id} required no changes.")
+        log.info(f"🎉 No changes needed for {profile_id}")
 
 async def main_async():
     if not TOKEN:
-        log.error("Missing TOKEN in .env")
+        log.error("Missing TOKEN")
         return
 
     async with httpx.AsyncClient(timeout=60, headers={"Authorization": f"Bearer {TOKEN}"}) as client:
-        # 1. Fetch Remote Lists (Once)
-        log.info("Fetching remote lists...")
-        raw = await asyncio.gather(*[fetch_json(client, url) for url in FOLDER_URLS])
-        valid_remotes = [r for r in raw if r]
+        log.info("Fetching blocklists...")
+        raw_results = await asyncio.gather(*[fetch_json(client, url) for url in FOLDER_URLS])
+        valid_remotes = [r for r in raw_results if r]
 
-        # 2. Discover Profiles
         targets = PROFILE_IDS
         if not targets:
             log.info("Auto-discovering profiles...")
             resp = await _api(client, "GET", "/profiles")
             targets = [p["PK"] for p in resp.json().get("body", {}).get("profiles", [])]
 
-        # 3. Execute
         for pid in targets:
             await sync_profile(client, pid, valid_remotes)
 
