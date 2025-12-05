@@ -1,323 +1,268 @@
 #!/usr/bin/env python3
 """
-Control D Sync (Async + Auto-Discovery)
----------------------------------------
-A high-performance helper that keeps ALL your Control D profiles in sync 
-with aggressive remote block-lists.
-
-Features:
-1. Auto-discovers all profiles (if none specified in .env).
-2. Uses asyncio for parallel fetching and rule pushing.
-3. Includes Badware Hoster & Spam TLDs.
-4. Robust rate limiting to prevent API errors.
+Control D Sync (Genius Edition)
+-------------------------------
+The ultimate state-machine for Control D.
+1. Fetches Remote & Local state in parallel.
+2. Calculates exact 'Delta' (Additions/Deletions).
+3. Uses Heuristics to choose strategy:
+   - Zero Drift -> Sleep (0s)
+   - Small Drift -> Surgical Patch (2-5s)
+   - Massive Drift -> Nuclear Rebuild (60s+)
 """
 
 import os
 import logging
 import asyncio
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, Tuple
 
 import httpx
-from tqdm.asyncio import tqdm
 from dotenv import load_dotenv
 
 # --------------------------------------------------------------------------- #
-# 0. Bootstrap
+# 0. Config & Tuning
 # --------------------------------------------------------------------------- #
 load_dotenv()
 
-# Configure logging to exclude httpx noise
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%H:%M:%S",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("control-d-sync")
+log = logging.getLogger("genius-sync")
 
-# --------------------------------------------------------------------------- #
-# 1. Constants
-# --------------------------------------------------------------------------- #
 API_BASE = "https://api.controld.com"
 TOKEN = os.getenv("TOKEN")
-
-# If PROFILE is set in .env, use those. If empty, script will auto-discover ALL.
-_env_profiles = os.getenv("PROFILE", "")
-PROFILE_IDS = [p.strip() for p in _env_profiles.split(",") if p.strip()]
+PROFILE_IDS = [p.strip() for p in os.getenv("PROFILE", "").split(",") if p.strip()]
 
 FOLDER_URLS = [
-    # --- Aggressive Security Layers (Requested) ---
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-tlds-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-idns-folder.json",
-    
-    # --- Native Trackers & Privacy ---
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-amazon-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-microsoft-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-tiktok-aggressive-folder.json",
-    
-    # --- Maintenance & Allow Lists ---
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/referral-allow-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/ultimate-known_issues-allow-folder.json",
 ]
 
-BATCH_SIZE = 500
+BATCH_SIZE = 1000
 MAX_RETRIES = 3
-RETRY_DELAY = 1.0
-CONCURRENCY_LIMIT = 5  # Limit concurrent API requests to avoid 429 errors
+# The "Tipping Point": If we have to delete more than this many rules, 
+# it's faster to nuke the whole folder than to delete them one by one.
+SURGICAL_THRESHOLD = 200 
+CONCURRENCY_LIMIT = 10
 
 # --------------------------------------------------------------------------- #
-# 2. Async Clients & Helpers
+# 1. Network Core
 # --------------------------------------------------------------------------- #
 
-async def _api_request(
-    client: httpx.AsyncClient, 
-    method: str, 
-    endpoint: str, 
-    **kwargs
-) -> httpx.Response:
-    """Generic async API wrapper with retries."""
+async def _api(client: httpx.AsyncClient, method: str, endpoint: str, **kwargs) -> httpx.Response:
     url = f"{API_BASE}{endpoint}"
-    for attempt in range(MAX_RETRIES):
+    for i in range(MAX_RETRIES):
         try:
-            response = await client.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response
-        except (httpx.HTTPError, httpx.TimeoutException) as e:
-            if attempt == MAX_RETRIES - 1:
-                if hasattr(e, 'response') and e.response is not None:
-                    log.error(f"Final Fail Content: {e.response.text}")
-                raise
-            
-            wait_time = RETRY_DELAY * (2 ** attempt)
-            log.warning(f"Retry {attempt + 1}/{MAX_RETRIES} for {endpoint} in {wait_time}s...")
-            await asyncio.sleep(wait_time)
-    raise httpx.HTTPError("Max retries exceeded")
+            resp = await client.request(method, url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except (httpx.HTTPError, httpx.TimeoutException):
+            if i == MAX_RETRIES - 1: raise
+            await asyncio.sleep(0.5 * (2 ** i))
+    return None
 
-async def fetch_github_json(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
-    """Fetch JSON from GitHub."""
-    resp = await client.get(url)
-    resp.raise_for_status()
-    return resp.json()
-
-async def fetch_all_profile_ids(client: httpx.AsyncClient) -> List[str]:
-    """Auto-discover all profile IDs from the account."""
+async def fetch_json(client: httpx.AsyncClient, url: str) -> Optional[Dict]:
     try:
-        log.info("Auto-discovering profiles...")
-        resp = await _api_request(client, "GET", "/profiles")
-        profiles = resp.json().get("body", {}).get("profiles", [])
-        ids = [p["PK"] for p in profiles if p.get("PK")]
-        log.info(f"Found {len(ids)} profiles: {ids}")
-        return ids
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        log.error(f"Failed to auto-discover profiles: {e}")
-        return []
+        log.error(f"Failed to download {url}: {e}")
+        return None
 
 # --------------------------------------------------------------------------- #
-# 3. Core Logic
+# 2. State & Analysis
 # --------------------------------------------------------------------------- #
 
-async def list_existing_folders(client: httpx.AsyncClient, profile_id: str) -> Dict[str, str]:
-    """Return folder-name -> folder-id mapping."""
-    try:
-        resp = await _api_request(client, "GET", f"/profiles/{profile_id}/groups")
-        folders = resp.json().get("body", {}).get("groups", [])
-        return {
-            f["group"].strip(): f["PK"]
-            for f in folders
-            if f.get("group") and f.get("PK")
-        }
-    except Exception as e:
-        log.error(f"Failed to list folders: {e}")
-        return {}
+async def get_profile_tree(client: httpx.AsyncClient, profile_id: str) -> Dict[str, Any]:
+    """
+    Returns: { "FolderName": { "id": "grp_123", "rules": {"example.com": "rule_abc123"} } }
+    We map Hostname -> RuleID so we can surgically delete specific rules later.
+    """
+    groups_resp = await _api(client, "GET", f"/profiles/{profile_id}/groups")
+    groups = groups_resp.json().get("body", {}).get("groups", [])
+    
+    folder_map = {}
+    
+    async def fetch_folder_details(grp):
+        name = grp["group"].strip()
+        pk = grp["PK"]
+        
+        # Get rules
+        rules_resp = await _api(client, "GET", f"/profiles/{profile_id}/rules/{pk}")
+        rules_data = rules_resp.json().get("body", {}).get("rules", [])
+        
+        # Map Hostname -> PK (Crucial for Delta Sync)
+        rule_dict = {r["PK"]: r["key"] for r in rules_data if r.get("PK") and r.get("key")}
+        return name, {"id": pk, "rules": rule_dict}
 
-async def get_folder_rules(client: httpx.AsyncClient, profile_id: str, folder_id: Optional[str] = None) -> Set[str]:
-    """Fetch rules for a specific folder (or root if folder_id is None)."""
-    endpoint = f"/profiles/{profile_id}/rules"
-    if folder_id:
-        endpoint += f"/{folder_id}"
-    
-    try:
-        resp = await _api_request(client, "GET", endpoint)
-        rules = resp.json().get("body", {}).get("rules", [])
-        return {r["PK"] for r in rules if r.get("PK")}
-    except httpx.HTTPError:
-        return set()
-
-async def get_all_existing_rules(client: httpx.AsyncClient, profile_id: str) -> Set[str]:
-    """Get all existing rules concurrently."""
-    all_rules = set()
-    
-    # 1. Get Root Rules
-    root_rules = await get_folder_rules(client, profile_id, None)
-    all_rules.update(root_rules)
-    
-    # 2. Get all folders
-    folders = await list_existing_folders(client, profile_id)
-    
-    # 3. Fetch all folder rules in parallel
-    tasks = [get_folder_rules(client, profile_id, fid) for fid in folders.values()]
+    tasks = [fetch_folder_details(g) for g in groups]
     if tasks:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
-            if isinstance(res, set):
-                all_rules.update(res)
+            if isinstance(res, tuple):
+                folder_map[res[0]] = res[1]
                 
-    log.info(f"Total existing rules across profile: {len(all_rules)}")
-    return all_rules
+    return folder_map
 
-async def delete_folder(client: httpx.AsyncClient, profile_id: str, name: str, folder_id: str):
-    await _api_request(client, "DELETE", f"/profiles/{profile_id}/groups/{folder_id}")
-    log.info(f"Deleted old folder: {name}")
+# --------------------------------------------------------------------------- #
+# 3. Operations (Surgical vs Nuclear)
+# --------------------------------------------------------------------------- #
 
-async def create_folder(client: httpx.AsyncClient, profile_id: str, name: str, do: int, status: int) -> Optional[str]:
-    try:
-        await _api_request(
-            client, 
-            "POST", 
-            f"/profiles/{profile_id}/groups",
-            json={"name": name, "do": do, "status": status}
-        )
-        # Brief pause to allow DB propagation
-        await asyncio.sleep(0.5)
-        folders = await list_existing_folders(client, profile_id)
-        return folders.get(name.strip())
-    except Exception as e:
-        log.error(f"Failed to create folder '{name}': {e}")
-        return None
-
-async def push_batch(client: httpx.AsyncClient, profile_id: str, data: Dict) -> bool:
-    """Helper to push a single batch."""
-    try:
-        await _api_request(
-            client, 
-            "POST", 
-            f"/profiles/{profile_id}/rules", 
-            data=data, 
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
-        )
-        return True
-    except Exception as e:
-        log.error(f"Batch failed: {e}")
-        return False
-
-async def process_folder_sync(
-    client: httpx.AsyncClient, 
-    profile_id: str, 
-    folder_data: Dict, 
-    existing_rules: Set[str],
-    semaphore: asyncio.Semaphore
-) -> bool:
-    """Handles the lifecycle of a single folder import."""
+async def op_nuclear_rebuild(client, pid, name, meta, hostnames, old_id):
+    """The 'Sledgehammer': Delete folder, create new, push all."""
+    log.info(f"☢️  [{name}] NUCLEAR REBUILD (Faster for massive changes)")
+    if old_id:
+        await _api(client, "DELETE", f"/profiles/{pid}/groups/{old_id}")
     
-    grp = folder_data["group"]
-    name = grp["group"].strip()
-    do = grp["action"]["do"]
-    status = grp["action"]["status"]
-    hostnames = [r["PK"] for r in folder_data.get("rules", []) if r.get("PK")]
+    # Create
+    cr = await _api(client, "POST", f"/profiles/{pid}/groups", 
+                    json={"name": name, "do": meta["do"], "status": meta["status"]})
     
-    # 1. Create Folder
-    async with semaphore:
-        folder_id = await create_folder(client, profile_id, name, do, status)
+    # Verify ID (Handling API race conditions)
+    new_id = cr.json().get("body", {}).get("groups", [{}])[0].get("PK")
+    if not new_id:
+        await asyncio.sleep(1)
+        grps = await _api(client, "GET", f"/profiles/{pid}/groups")
+        for g in grps.json().get("body", {}).get("groups", []):
+            if g["group"] == name: new_id = g["PK"]
     
-    if not folder_id:
-        return False
+    if not new_id: return
 
-    # 2. Filter Duplicates
-    filtered = [h for h in hostnames if h not in existing_rules]
-    
-    if not filtered:
-        log.info(f"[{name}] Sync complete (No new rules)")
-        return True
-
-    # 3. Push Batches
-    batches = [filtered[i:i + BATCH_SIZE] for i in range(0, len(filtered), BATCH_SIZE)]
-    success_count = 0
-    
-    async for batch in tqdm(batches, desc=f"Syncing {name}", unit="batch", leave=False):
-        data = {
-            "do": str(do), 
-            "status": str(status), 
-            "group": str(folder_id)
-        }
-        for j, h in enumerate(batch):
-            data[f"hostnames[{j}]"] = h
+    # Batch Push
+    batches = [hostnames[i:i + BATCH_SIZE] for i in range(0, len(hostnames), BATCH_SIZE)]
+    tasks = []
+    for batch in batches:
+        data = {"do": str(meta["do"]), "status": str(meta["status"]), "group": str(new_id)}
+        for j, h in enumerate(batch): data[f"hostnames[{j}]"] = h
         
-        async with semaphore:
-            if await push_batch(client, profile_id, data):
-                success_count += 1
-                existing_rules.update(batch)
+        # Async push batches (We don't need to wait for order)
+        tasks.append(_api(client, "POST", f"/profiles/{pid}/rules", data=data))
+    
+    await asyncio.gather(*tasks)
 
-    return success_count == len(batches)
+async def op_surgical_patch(client, pid, name, folder_id, meta, to_add, to_delete, rule_map):
+    """The 'Scalpel': Add specific domains, Delete specific IDs."""
+    log.info(f"🩺 [{name}] SURGICAL PATCH (+{len(to_add)} / -{len(to_delete)})")
+    
+    # 1. Deletions (Must happen individually or in small parallel bursts)
+    if to_delete:
+        async def delete_one(hostname):
+            rule_id = rule_map.get(hostname)
+            if rule_id:
+                await _api(client, "DELETE", f"/profiles/{pid}/rules/{rule_id}")
+
+        # Limit concurrency for deletions so we don't 429
+        sem = asyncio.Semaphore(10)
+        async def safe_delete(h):
+            async with sem: await delete_one(h)
+            
+        await asyncio.gather(*[safe_delete(h) for h in to_delete])
+
+    # 2. Additions (Can be batched)
+    if to_add:
+        batches = [list(to_add)[i:i + BATCH_SIZE] for i in range(0, len(to_add), BATCH_SIZE)]
+        tasks = []
+        for batch in batches:
+            data = {"do": str(meta["do"]), "status": str(meta["status"]), "group": str(folder_id)}
+            for j, h in enumerate(batch): data[f"hostnames[{j}]"] = h
+            tasks.append(_api(client, "POST", f"/profiles/{pid}/rules", data=data))
+        await asyncio.gather(*tasks)
 
 # --------------------------------------------------------------------------- #
-# 4. Main Workflow
+# 4. The Brain
 # --------------------------------------------------------------------------- #
 
-async def sync_profile(client: httpx.AsyncClient, profile_id: str):
-    log.info(f"--- Starting Sync for Profile: {profile_id} ---")
+async def sync_profile(client: httpx.AsyncClient, profile_id: str, remote_data: List[Dict]):
+    log.info(f"--- Analyzing Profile: {profile_id} ---")
     
-    # A. Fetch all GitHub JSONs
-    log.info("Fetching remote blocklists...")
-    gh_tasks = [fetch_github_json(client, url) for url in FOLDER_URLS]
-    folder_data_list = await asyncio.gather(*gh_tasks, return_exceptions=True)
+    # Fetch current state (Map of Hostnames -> RuleIDs)
+    current_state = await get_profile_tree(client, profile_id)
     
-    valid_data = [res for res in folder_data_list if isinstance(res, dict)]
-    if not valid_data:
-        log.error("No valid blocklist data found.")
-        return
+    tasks = []
+    
+    for remote in remote_data:
+        name = remote["group"]["group"].strip()
+        do = remote["group"]["action"]["do"]
+        status = remote["group"]["action"]["status"]
+        
+        remote_hosts = set([r["PK"] for r in remote.get("rules", []) if r.get("PK")])
+        
+        # Default: Nuclear if folder missing
+        strategy = "nuclear"
+        curr_hosts = set()
+        folder_id = None
+        rule_map = {}
+        
+        if name in current_state:
+            folder_data = current_state[name]
+            folder_id = folder_data["id"]
+            rule_map = folder_data["rules"] # dict {hostname: rule_pk}
+            curr_hosts = set(rule_map.keys())
+            
+            # --- The Genius Calculation ---
+            if remote_hosts == curr_hosts:
+                log.info(f"✅ [{name}] Perfectly synced. Skipping.")
+                continue
+                
+            to_add = remote_hosts - curr_hosts
+            to_delete = curr_hosts - remote_hosts
+            
+            # Cost Analysis
+            # If we have to delete too many individual rules, the API gets slow.
+            # Nuclear is O(1) delete + O(N) write. Surgical is O(N) delete + O(N) write.
+            if len(to_delete) > SURGICAL_THRESHOLD:
+                strategy = "nuclear"
+            else:
+                strategy = "surgical"
+        else:
+            to_add = remote_hosts
+            to_delete = set()
 
-    # B. Clean up old folders
-    existing_folders = await list_existing_folders(client, profile_id)
-    delete_tasks = []
-    for data in valid_data:
-        name = data["group"]["group"].strip()
-        if name in existing_folders:
-            delete_tasks.append(delete_folder(client, profile_id, name, existing_folders[name]))
-    
-    if delete_tasks:
-        await asyncio.gather(*delete_tasks)
+        # Enqueue the work
+        if strategy == "nuclear":
+            tasks.append(op_nuclear_rebuild(client, profile_id, name, {"do": do, "status": status}, list(remote_hosts), folder_id))
+        else:
+            tasks.append(op_surgical_patch(client, profile_id, name, folder_id, {"do": do, "status": status}, to_add, to_delete, rule_map))
 
-    # C. Build Exclusion List (Existing Rules)
-    log.info("Building existing rule index...")
-    existing_rules = await get_all_existing_rules(client, profile_id)
-
-    # D. Create and Push
-    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    sync_tasks = [
-        process_folder_sync(client, profile_id, data, existing_rules, sem)
-        for data in valid_data
-    ]
-    
-    results = await asyncio.gather(*sync_tasks)
-    success = sum(1 for r in results if r)
-    log.info(f"Profile {profile_id} finished: {success}/{len(valid_data)} lists synced.")
+    if tasks:
+        await asyncio.gather(*tasks)
+    else:
+        log.info(f"🎉 Profile {profile_id} required no changes.")
 
 async def main_async():
     if not TOKEN:
         log.error("Missing TOKEN in .env")
         return
 
-    # Create one client session for the whole run
-    async with httpx.AsyncClient(timeout=30, headers={"Authorization": f"Bearer {TOKEN}"}) as client:
-        # Determine targets
-        if PROFILE_IDS:
-            target_profiles = PROFILE_IDS
-            log.info(f"Targeting {len(target_profiles)} specific profiles from .env")
-        else:
-            target_profiles = await fetch_all_profile_ids(client)
-            if not target_profiles:
-                log.error("No profiles found on account!")
-                return
+    async with httpx.AsyncClient(timeout=60, headers={"Authorization": f"Bearer {TOKEN}"}) as client:
+        # 1. Fetch Remote Lists (Once)
+        log.info("Fetching remote lists...")
+        raw = await asyncio.gather(*[fetch_json(client, url) for url in FOLDER_URLS])
+        valid_remotes = [r for r in raw if r]
 
-        for pid in target_profiles:
-            await sync_profile(client, pid)
+        # 2. Discover Profiles
+        targets = PROFILE_IDS
+        if not targets:
+            log.info("Auto-discovering profiles...")
+            resp = await _api(client, "GET", "/profiles")
+            targets = [p["PK"] for p in resp.json().get("body", {}).get("profiles", [])]
+
+        # 3. Execute
+        for pid in targets:
+            await sync_profile(client, pid, valid_remotes)
 
 def main():
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        log.info("Sync interrupted by user.")
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
