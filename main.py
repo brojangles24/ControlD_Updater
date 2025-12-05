@@ -193,9 +193,11 @@ async def sync_profile(client: httpx.AsyncClient, profile_id: str, remote_data: 
         rule_map = {}
         strategy = "nuclear"
 
-         if name in current_state:
+        # This was the line causing your error:
+        if name in current_state:
             folder_id = current_state[name]["id"]
             rule_map = current_state[name]["rules"]
+            # FIX: Compare Values (Hostnames), not Keys (IDs)
             curr_hosts = set(rule_map.values())
             
             if remote_hosts == curr_hosts:
