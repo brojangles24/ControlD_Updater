@@ -193,10 +193,10 @@ async def sync_profile(client: httpx.AsyncClient, profile_id: str, remote_data: 
         rule_map = {}
         strategy = "nuclear"
 
-        if name in current_state:
+         if name in current_state:
             folder_id = current_state[name]["id"]
             rule_map = current_state[name]["rules"]
-            curr_hosts = set(rule_map.keys())
+            curr_hosts = set(rule_map.values())
             
             if remote_hosts == curr_hosts:
                 log.info(f"✅ [{name}] Synced.")
@@ -222,25 +222,33 @@ async def sync_profile(client: httpx.AsyncClient, profile_id: str, remote_data: 
         await asyncio.gather(*tasks)
     else:
         log.info(f"🎉 No changes needed for {profile_id}")
-
+       
 async def main_async():
     if not TOKEN:
         log.error("Missing TOKEN")
         return
 
-    async with httpx.AsyncClient(timeout=60, headers={"Authorization": f"Bearer {TOKEN}"}) as client:
-        log.info("Fetching blocklists...")
-        raw_results = await asyncio.gather(*[fetch_json(client, url) for url in FOLDER_URLS])
+    # 1. Fetch Blocklists (Use a CLEAN client - No Headers!)
+    log.info("Fetching blocklists...")
+    async with httpx.AsyncClient(timeout=60) as fetch_client:
+        # This will now work because we aren't sending the ControlD token to GitHub
+        raw_results = await asyncio.gather(*[fetch_json(fetch_client, url) for url in FOLDER_URLS])
         valid_remotes = [r for r in raw_results if r]
 
+    if not valid_remotes:
+        log.error("❌ No blocklists fetched. Check URLs or connection.")
+        return
+
+    # 2. Sync Config (Use an AUTH client - With Headers)
+    async with httpx.AsyncClient(timeout=60, headers={"Authorization": f"Bearer {TOKEN}"}) as api_client:
         targets = PROFILE_IDS
         if not targets:
             log.info("Auto-discovering profiles...")
-            resp = await _api(client, "GET", "/profiles")
+            resp = await _api(api_client, "GET", "/profiles")
             targets = [p["PK"] for p in resp.json().get("body", {}).get("profiles", [])]
 
         for pid in targets:
-            await sync_profile(client, pid, valid_remotes)
+            await sync_profile(api_client, pid, valid_remotes)
 
 def main():
     asyncio.run(main_async())
