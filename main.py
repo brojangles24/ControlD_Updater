@@ -208,7 +208,7 @@ async def main_async():
         log.error("Missing TOKEN env var.")
         return
 
-    EXCLUDED_PROFILES = ["780037lax6zo"]
+    EXCLUDED_PROFILES = ["793407laxinb"]
     
     # Load previous state
     state = load_state()
