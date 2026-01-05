@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 import os
-import json
 import logging
 import asyncio
-import hashlib
-from typing import Dict, List, Any
 import httpx
 
 # --- 1. Config ---
@@ -13,118 +10,102 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("scorched-earth")
+log = logging.getLogger("punycode-nuclear")
 
 API_BASE = "https://api.controld.com"
 TOKEN = os.getenv("TOKEN")
-STATE_FILE = "state.json"
-
-# Corrected URL path
-FOLDER_URLS = [
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json",
-]
 
 # --- 2. Helper Logic ---
 
-def load_state() -> Dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r') as f: return json.load(f)
-        except: return {}
-    return {}
+async def get_or_create_folder(client: httpx.AsyncClient, profile_id: str) -> str:
+    """Ensures a 'Nuclear Blocks' folder exists so rules are visible in GUI."""
+    try:
+        resp = await client.get(f"{API_BASE}/profiles/{profile_id}/groups")
+        resp.raise_for_status()
+        groups = resp.json().get("body", {}).get("groups", [])
+        
+        for g in groups:
+            if g["group"].strip() == "Nuclear Blocks":
+                return g["PK"]
+        
+        log.info(f"📁 [Profile {profile_id}] Creating 'Nuclear Blocks' folder...")
+        resp = await client.post(
+            f"{API_BASE}/profiles/{profile_id}/groups",
+            data={"name": "Nuclear Blocks", "do": 0, "status": 1}
+        )
+        return resp.json().get("body", {}).get("PK")
+    except Exception as e:
+        log.error(f"❌ [Profile {profile_id}] Folder creation failed: {e}")
+        return None
 
-def save_state(state: Dict):
-    with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
+async def block_punycode_nuclear(client: httpx.AsyncClient, profile_id: str):
+    """
+    Injects permanent Punycode blocks for root (xn--*) and subdomains (*.xn--*).
+    Sets ttl=0 to ensure rules never expire.
+    """
+    folder_id = await get_or_create_folder(client, profile_id)
+    if not folder_id:
+        return
 
-def calculate_hash(data: Dict) -> str:
-    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
-
-async def get_or_create_folder(client: httpx.AsyncClient, profile_id: str, name: str) -> str:
-    resp = await client.get(f"{API_BASE}/profiles/{profile_id}/groups")
-    groups = resp.json().get("body", {}).get("groups", [])
-    for g in groups:
-        if g["group"].strip() == name: return g["PK"]
-    
-    res = await client.post(f"{API_BASE}/profiles/{profile_id}/groups", data={"name": name, "do": 0, "status": 1})
-    return res.json().get("body", {}).get("PK")
-
-# --- 3. Nuclear Actions ---
-
-async def ensure_punycode_lockdown(client: httpx.AsyncClient, profile_id: str):
-    """Enforce permanent block on all Punycode root and subdomains."""
-    folder_id = await get_or_create_folder(client, profile_id, "Nuclear Blocks")
     targets = ["xn--*", "*.xn--*"]
     
     for i, target in enumerate(targets):
-        # Index keys hostnames[i] are required for form-data
-        data = {f"hostnames[{i}]": target, "do": 0, "status": 1, "group": folder_id, "ttl": 0}
-        await client.post(f"{API_BASE}/profiles/{profile_id}/rules", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-
-async def sync_badware(client: httpx.AsyncClient, profile_id: str, remote_data: List[Dict], state: Dict):
-    """Sync specialized Badware Hoster lists."""
-    for remote in remote_data:
-        name = remote["group"]["group"].strip()
-        new_hash = calculate_hash(remote)
+        data = {
+            f"hostnames[{i}]": target,
+            "do": 0,      # Block
+            "status": 1,  # Active
+            "group": folder_id,
+            "ttl": 0      # Permanent
+        }
         
-        if state.get(profile_id, {}).get(name) == new_hash:
-            log.info(f"⏩ [Profile {profile_id}] [{name}] No changes. Skipping.")
-            continue
+        try:
+            resp = await client.post(
+                f"{API_BASE}/profiles/{profile_id}/rules",
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            
+            if resp.status_code == 200:
+                log.info(f"✅ [Profile {profile_id}] Blocked: {target}")
+            else:
+                body = resp.json()
+                msg = body.get("error", {}).get("message", "Unknown Error")
+                if "already exists" in msg.lower():
+                    log.info(f"ℹ️  [Profile {profile_id}] {target} already exists.")
+                else:
+                    log.error(f"❌ [Profile {profile_id}] {target} Rejected: {msg}")
+                    
+        except Exception as e:
+            log.error(f"❌ [Profile {profile_id}] API Error on {target}: {e}")
 
-        log.info(f"🔄 [Profile {profile_id}] [{name}] Updating Badware...")
-        
-        # 1. Get current folders to find ID for nuclear delete
-        resp = await client.get(f"{API_BASE}/profiles/{profile_id}/groups")
-        groups = resp.json().get("body", {}).get("groups", [])
-        old_id = next((g["PK"] for g in groups if g["group"].strip() == name), None)
-        if old_id: await client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{old_id}")
-
-        # 2. Create New Folder
-        new_id = await get_or_create_folder(client, profile_id, name)
-        
-        # 3. Push Rules in Batches of 200
-        rules = [r["PK"] for r in remote.get("rules", [])]
-        for i in range(0, len(rules), 200):
-            batch = rules[i:i+200]
-            payload = {"do": 0, "status": 1, "group": new_id, "ttl": 0}
-            for j, hostname in enumerate(batch): 
-                payload[f"hostnames[{j}]"] = hostname
-            await client.post(f"{API_BASE}/profiles/{profile_id}/rules", data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        
-        state.setdefault(profile_id, {})[name] = new_hash
-
-# --- 4. Main ---
+# --- 3. Main Execution ---
 
 async def main():
-    if not TOKEN: 
-        log.error("Missing TOKEN")
+    if not TOKEN:
+        log.error("Missing TOKEN environment variable.")
         return
-        
-    state = load_state()
 
-    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60) as client:
-        log.info("📥 Fetching Badware source...")
+    async with httpx.AsyncClient(
+        headers={"Authorization": f"Bearer {TOKEN}"}, 
+        timeout=30,
+        follow_redirects=True
+    ) as client:
+        
+        log.info("📥 Fetching all profiles...")
         try:
-            remote_data = []
-            for url in FOLDER_URLS:
-                resp = await client.get(url)
-                resp.raise_for_status() # Prevents JSONDecodeError on 404
-                remote_data.append(resp.json())
-                
-            profiles_resp = await client.get(f"{API_BASE}/profiles")
-            profiles_resp.raise_for_status()
-            profiles = profiles_resp.json().get("body", {}).get("profiles", [])
+            resp = await client.get(f"{API_BASE}/profiles")
+            resp.raise_for_status()
+            profiles = resp.json().get("body", {}).get("profiles", [])
             
-            for p in profiles:
-                pid = p["PK"]
-                await ensure_punycode_lockdown(client, pid)
-                await sync_badware(client, pid, remote_data, state)
-                
+            pids = [p["PK"] for p in profiles]
+            log.info(f"🚀 Found {len(pids)} profiles. Starting lockdown...")
+
+            # Run all blocks concurrently
+            tasks = [block_punycode_nuclear(client, pid) for pid in pids]
+            await asyncio.gather(*tasks)
+            
         except Exception as e:
-            log.error(f"❌ Script failed: {e}")
-            return
-            
-    save_state(state)
-    log.info("💾 State saved and lockdown complete.")
+            log.error(f"❌ Failed to fetch profiles: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
