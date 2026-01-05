@@ -120,7 +120,7 @@ async def main_async():
         log.error("Missing TOKEN env var.")
         return
 
-    EXCLUDED_PROFILES = ["793407laxinb"]
+    EXCLUDED_PROFILES = [""]
     state = load_state()
 
     async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60) as auth_client, \
