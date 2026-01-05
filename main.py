@@ -19,7 +19,7 @@ API_BASE = "https://api.controld.com"
 TOKEN = os.getenv("TOKEN")
 STATE_FILE = "state.json"
 
-# Specialized Badware list not found in Ultimate/TIF
+# Corrected URL path
 FOLDER_URLS = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json",
 ]
@@ -56,6 +56,7 @@ async def ensure_punycode_lockdown(client: httpx.AsyncClient, profile_id: str):
     targets = ["xn--*", "*.xn--*"]
     
     for i, target in enumerate(targets):
+        # Index keys hostnames[i] are required for form-data
         data = {f"hostnames[{i}]": target, "do": 0, "status": 1, "group": folder_id, "ttl": 0}
         await client.post(f"{API_BASE}/profiles/{profile_id}/rules", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
 
@@ -71,20 +72,22 @@ async def sync_badware(client: httpx.AsyncClient, profile_id: str, remote_data: 
 
         log.info(f"🔄 [Profile {profile_id}] [{name}] Updating Badware...")
         
-        # 1. Delete old folder if exists to clear rules
-        groups = (await client.get(f"{API_BASE}/profiles/{profile_id}/groups")).json().get("body", {}).get("groups", [])
+        # 1. Get current folders to find ID for nuclear delete
+        resp = await client.get(f"{API_BASE}/profiles/{profile_id}/groups")
+        groups = resp.json().get("body", {}).get("groups", [])
         old_id = next((g["PK"] for g in groups if g["group"].strip() == name), None)
         if old_id: await client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{old_id}")
 
         # 2. Create New Folder
         new_id = await get_or_create_folder(client, profile_id, name)
         
-        # 3. Push Rules in Batches
+        # 3. Push Rules in Batches of 200
         rules = [r["PK"] for r in remote.get("rules", [])]
         for i in range(0, len(rules), 200):
             batch = rules[i:i+200]
-            payload = {"do": 0, "status": 1, "group": new_id}
-            for j, hostname in enumerate(batch): payload[f"hostnames[{j}]"] = hostname
+            payload = {"do": 0, "status": 1, "group": new_id, "ttl": 0}
+            for j, hostname in enumerate(batch): 
+                payload[f"hostnames[{j}]"] = hostname
             await client.post(f"{API_BASE}/profiles/{profile_id}/rules", data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
         
         state.setdefault(profile_id, {})[name] = new_hash
@@ -92,21 +95,36 @@ async def sync_badware(client: httpx.AsyncClient, profile_id: str, remote_data: 
 # --- 4. Main ---
 
 async def main():
-    if not TOKEN: return log.error("Missing TOKEN")
+    if not TOKEN: 
+        log.error("Missing TOKEN")
+        return
+        
     state = load_state()
 
     async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60) as client:
         log.info("📥 Fetching Badware source...")
-        remote_data = [(await client.get(url)).json() for url in FOLDER_URLS]
-        profiles = (await client.get(f"{API_BASE}/profiles")).json().get("body", {}).get("profiles", [])
-        
-        for p in profiles:
-            pid = p["PK"]
-            await ensure_punycode_lockdown(client, pid)
-            await sync_badware(client, pid, remote_data, state)
+        try:
+            remote_data = []
+            for url in FOLDER_URLS:
+                resp = await client.get(url)
+                resp.raise_for_status() # Prevents JSONDecodeError on 404
+                remote_data.append(resp.json())
+                
+            profiles_resp = await client.get(f"{API_BASE}/profiles")
+            profiles_resp.raise_for_status()
+            profiles = profiles_resp.json().get("body", {}).get("profiles", [])
+            
+            for p in profiles:
+                pid = p["PK"]
+                await ensure_punycode_lockdown(client, pid)
+                await sync_badware(client, pid, remote_data, state)
+                
+        except Exception as e:
+            log.error(f"❌ Script failed: {e}")
+            return
             
     save_state(state)
-    log.info("💾 State saved.")
+    log.info("💾 State saved and lockdown complete.")
 
 if __name__ == "__main__":
     asyncio.run(main())
