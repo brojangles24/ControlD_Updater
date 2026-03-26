@@ -23,7 +23,8 @@ TOKEN = os.getenv("TOKEN")
 STATE_FILE = "state.json"
 
 FOLDER_URLS = [
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/spam-tlds-combined-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/spam-tlds-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/spam-idns-folder.json",
 ]
 
 BATCH_SIZE = 200
@@ -31,7 +32,6 @@ MAX_RETRIES = 3
 CONCURRENCY_LIMIT = 5 
 RULE_LIMIT = 10000
 
-# Added the new profiles to the exclusion list
 EXCLUDED_PROFILES = [
     "793407laxinb",
     "712995laxgov", 
