@@ -29,7 +29,7 @@ FOLDER_URLS = [
 BATCH_SIZE = 200
 MAX_RETRIES = 3
 CONCURRENCY_LIMIT = 5 
-RULE_LIMIT = 10000 # Control D per-profile hard cap
+RULE_LIMIT = 10000
 
 # --------------------------------------------------------------------------- #
 # 1. State Management
@@ -115,7 +115,6 @@ async def push_rules(client: httpx.AsyncClient, profile_id, folder_name, folder_
             "hostnames": batch
         }
         
-        # 404 Retry loop for the first batch to handle API propagation delay
         if i == 1:
             for attempt in range(5):
                 try:
@@ -157,7 +156,9 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
             state[profile_id] = {}
 
         for remote in remote_data:
-            name = remote["group"]["group"].strip()
+            group_data = remote.get("group", {})
+            name = group_data.get("group", "Unnamed Folder").strip()
+            
             new_hash = calculate_hash(remote)
             stored_hash = state[profile_id].get(name)
             
@@ -173,12 +174,13 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
 
             log.info(f"🔄 [{name}] Update detected. Executing zero-downtime swap...")
             
-            do_action = remote["group"]["action"]["do"]
-            status = remote["group"]["action"]["status"]
+            action_data = group_data.get("action", {})
+            do_action = action_data.get("do", group_data.get("do", 0))
+            status = action_data.get("status", group_data.get("status", 1))
+            
             temp_name = f"{name}_tmp"
 
             try:
-                # 1. Create Temp Group
                 await _retry_request(lambda: auth_client.post(
                     f"{API_BASE}/profiles/{profile_id}/groups", 
                     json={"name": temp_name, "do": int(do_action), "status": int(status)}
@@ -188,14 +190,11 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
                 new_id = updated_folders.get(temp_name)
                 
                 if new_id:
-                    # 2. Push rules to Temp Group
                     await push_rules(auth_client, profile_id, temp_name, new_id, do_action, status, rules)
                     
-                    # 3. Delete Old Group
                     if name in current_folders:
                         await _retry_request(lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[name]}"))
 
-                    # 4. Rename Temp Group to Original Name
                     await _retry_request(lambda: auth_client.put(
                         f"{API_BASE}/profiles/{profile_id}/groups/{new_id}",
                         json={"name": name}
