@@ -31,6 +31,13 @@ MAX_RETRIES = 3
 CONCURRENCY_LIMIT = 5 
 RULE_LIMIT = 10000
 
+# Added the new profiles to the exclusion list
+EXCLUDED_PROFILES = [
+    "793407laxinb",
+    "712995laxgov", 
+    "789687laxwlw"
+]
+
 # --------------------------------------------------------------------------- #
 # 1. State Management
 # --------------------------------------------------------------------------- #
@@ -162,11 +169,6 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
             new_hash = calculate_hash(remote)
             stored_hash = state[profile_id].get(name)
             
-            # Extract folder-level default actions
-            action_data = group_data.get("action", {})
-            folder_do = int(action_data.get("do", group_data.get("do", 0)))
-            folder_status = int(action_data.get("status", group_data.get("status", 1)))
-            
             raw_rules = remote.get("rules", [])
             
             if name in current_folders and stored_hash == new_hash:
@@ -186,10 +188,10 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
                 if not hostname:
                     continue
                 
-                # If rule has its own action, use it; otherwise inherit folder's action
+                # Use rule's specific action; default to block (0) and active (1)
                 r_action = r.get("action", {})
-                r_do = int(r_action.get("do", folder_do))
-                r_status = int(r_action.get("status", folder_status))
+                r_do = int(r_action.get("do", 0)) 
+                r_status = int(r_action.get("status", 1))
                 
                 key = (r_do, r_status)
                 if key not in action_buckets:
@@ -199,19 +201,22 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
             temp_name = f"{name}_tmp"
 
             try:
-                # 1. Create Temp Group
+                # 1. Create Temp Group (Omit 'do' and 'status' to avoid global folder rule)
                 await _retry_request(lambda: auth_client.post(
                     f"{API_BASE}/profiles/{profile_id}/groups", 
-                    json={"name": temp_name, "do": folder_do, "status": folder_status}
+                    json={"name": temp_name}
                 ))
                 
                 updated_folders = await list_folders(auth_client, profile_id)
                 new_id = updated_folders.get(temp_name)
                 
                 if new_id:
-                    # 2. Push rules from each bucket
-                    for (b_do, b_status), hostnames in action_buckets.items():
-                        await push_rules(auth_client, profile_id, temp_name, new_id, b_do, b_status, hostnames)
+                    # 2. Push rules concurrently via action buckets
+                    push_tasks = [
+                        push_rules(auth_client, profile_id, temp_name, new_id, b_do, b_status, hostnames)
+                        for (b_do, b_status), hostnames in action_buckets.items()
+                    ]
+                    await asyncio.gather(*push_tasks)
                     
                     # 3. Delete Old Group
                     if name in current_folders:
@@ -230,13 +235,21 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
 
             except Exception as e:
                 log.error(f"❌ [{name}] Sync failed: {e}")
+            finally:
+                # Cleanup: If the sync failed midway, attempt to delete the orphaned temp folder
+                try:
+                    cleanup_folders = await list_folders(auth_client, profile_id)
+                    if temp_name in cleanup_folders:
+                        log.info(f"🧹 Cleaning up orphaned temp folder: {temp_name}")
+                        await _retry_request(lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{cleanup_folders[temp_name]}"))
+                except Exception:
+                    pass
 
 async def main_async():
     if not TOKEN:
         log.error("Missing TOKEN env var.")
         return
 
-    EXCLUDED_PROFILES = ["793407laxinb"]
     state = load_state()
 
     try:
