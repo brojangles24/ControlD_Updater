@@ -29,6 +29,7 @@ FOLDER_URLS = [
 BATCH_SIZE = 200
 MAX_RETRIES = 3
 CONCURRENCY_LIMIT = 5 
+RULE_LIMIT = 10000 # Control D per-profile hard cap
 
 # --------------------------------------------------------------------------- #
 # 1. State Management
@@ -63,7 +64,6 @@ async def _retry_request(request_func):
             response.raise_for_status()
             return response
         except httpx.HTTPStatusError as e:
-            # Don't retry 400s (Bad Request) or 401s (Unauthorized)
             if e.response.status_code in [400, 401]:
                 raise
             if attempt == MAX_RETRIES - 1:
@@ -96,29 +96,49 @@ async def list_folders(client: httpx.AsyncClient, profile_id: str) -> Dict[str, 
     except Exception:
         return {}
 
+async def get_rule_count(client: httpx.AsyncClient, profile_id: str) -> int:
+    try:
+        resp = await _retry_request(lambda: client.get(f"{API_BASE}/profiles/{profile_id}/rules"))
+        data = resp.json()
+        return len(data.get("body", {}).get("rules", []))
+    except Exception:
+        return 0
+
 async def push_rules(client: httpx.AsyncClient, profile_id, folder_name, folder_id, do, status, hostnames):
     batches = [hostnames[i:i + BATCH_SIZE] for i in range(0, len(hostnames), BATCH_SIZE)]
     
     for i, batch in enumerate(batches, 1):
-        data = {"do": str(do), "status": str(status), "group": str(folder_id)}
-        for j, h in enumerate(batch):
-            data[f"hostnames[{j}]"] = h
-            
-        try:
-            await _retry_request(lambda: client.post(
-                f"{API_BASE}/profiles/{profile_id}/rules", 
-                data=data, 
-                headers={"Content-Type": "application/x-www-form-urlencoded"}
-            ))
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400:
-                log.warning(f"  ⚠️ [{folder_name}] Batch {i} failed. Retrying entries individually...")
-                for h in batch:
-                    try:
-                        single_data = {"do": str(do), "status": str(status), "group": str(folder_id), "hostnames[0]": h}
-                        await client.post(f"{API_BASE}/profiles/{profile_id}/rules", data=single_data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-                    except Exception:
-                        pass
+        payload = {
+            "do": int(do),
+            "status": int(status),
+            "group": str(folder_id),
+            "hostnames": batch
+        }
+        
+        # 404 Retry loop for the first batch to handle API propagation delay
+        if i == 1:
+            for attempt in range(5):
+                try:
+                    resp = await client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=payload)
+                    resp.raise_for_status()
+                    break
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        await asyncio.sleep(1)
+                        continue
+                    raise e
+        else:
+            try:
+                await _retry_request(lambda: client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=payload))
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400:
+                    log.warning(f"  ⚠️ [{folder_name}] Batch {i} failed. Retrying entries individually...")
+                    for h in batch:
+                        try:
+                            single_payload = {**payload, "hostnames": [h]}
+                            await client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=single_payload)
+                        except Exception:
+                            pass
 
 # --------------------------------------------------------------------------- #
 # 3. Main Sync Logic
@@ -127,6 +147,10 @@ async def push_rules(client: httpx.AsyncClient, profile_id, folder_name, folder_
 async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncClient, profile_id: str, remote_data: List[Dict], state: Dict):
     async with sem:
         log.info(f"--- Processing Profile: {profile_id} ---")
+        
+        current_rules = await get_rule_count(auth_client, profile_id)
+        log.info(f"📊 Current Rule Count: {current_rules}/{RULE_LIMIT}")
+
         current_folders = await list_folders(auth_client, profile_id)
         
         if profile_id not in state:
@@ -137,40 +161,50 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
             new_hash = calculate_hash(remote)
             stored_hash = state[profile_id].get(name)
             
+            rules = [r["PK"] for r in remote.get("rules", []) if r.get("PK")]
+            
             if name in current_folders and stored_hash == new_hash:
                 log.info(f"⏩ [{name}] No changes. Skipping.")
                 continue
             
-            log.info(f"🔄 [{name}] Update detected.")
+            if current_rules + len(rules) > RULE_LIMIT:
+                log.error(f"❌ [{name}] Sync aborted. Adding {len(rules)} rules exceeds 10k limit.")
+                continue
+
+            log.info(f"🔄 [{name}] Update detected. Executing zero-downtime swap...")
             
             do_action = remote["group"]["action"]["do"]
             status = remote["group"]["action"]["status"]
-            rules = [r["PK"] for r in remote.get("rules", []) if r.get("PK")]
+            temp_name = f"{name}_tmp"
 
-            # Remove old group if it exists
-            if name in current_folders:
-                try:
-                    await _retry_request(lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[name]}"))
-                except Exception:
-                    pass
-
-            # Create New Group & Rules
             try:
+                # 1. Create Temp Group
                 await _retry_request(lambda: auth_client.post(
                     f"{API_BASE}/profiles/{profile_id}/groups", 
-                    data={"name": name, "do": do_action, "status": status}
+                    json={"name": temp_name, "do": int(do_action), "status": int(status)}
                 ))
-                await asyncio.sleep(1) # API propagation delay
                 
                 updated_folders = await list_folders(auth_client, profile_id)
-                new_id = updated_folders.get(name)
+                new_id = updated_folders.get(temp_name)
                 
                 if new_id:
-                    await push_rules(auth_client, profile_id, name, new_id, do_action, status, rules)
+                    # 2. Push rules to Temp Group
+                    await push_rules(auth_client, profile_id, temp_name, new_id, do_action, status, rules)
+                    
+                    # 3. Delete Old Group
+                    if name in current_folders:
+                        await _retry_request(lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[name]}"))
+
+                    # 4. Rename Temp Group to Original Name
+                    await _retry_request(lambda: auth_client.put(
+                        f"{API_BASE}/profiles/{profile_id}/groups/{new_id}",
+                        json={"name": name}
+                    ))
+
                     state[profile_id][name] = new_hash
                     log.info(f"✅ [{name}] Synced.")
                 else:
-                    log.error(f"❌ [{name}] Failed to verify creation.")
+                    log.error(f"❌ [{name}] Failed to verify temp folder creation.")
 
             except Exception as e:
                 log.error(f"❌ [{name}] Sync failed: {e}")
