@@ -2,16 +2,21 @@ name: Control D Sync
 
 on:
   schedule:
-    #- cron: '0 5 5 * *'
+    # OFFSET CRON: Runs every day at 05:17 UTC to avoid GitHub's top-of-the-hour queue delays.
+    - cron: '17 5 * * *'
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      # Give the bot permission to write to the repo
       contents: write
     
+    # Optional but recommended: Prevent overlapping runs if a previous sync hung
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,22 +25,28 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip' # Speeds up future runs by caching dependencies
 
       - name: Install dependencies
         run: |
-          pip install httpx python-dotenv
+          pip install httpx
 
       - name: Run Sync Script
         env:
-          TOKEN: ${{ secrets.CONTROLD_TOKEN }}
+          # Your script looks for 'TOKEN', ensure this matches your GitHub Secret name exactly
+          TOKEN: ${{ secrets.CONTROLD_TOKEN }} 
         run: python main.py
 
       - name: Commit and Push State
-        # Only run if state.json changed
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add state.json
-          # The command below will fail if there are no changes, which is fine (we ignore error with || echo)
-          git commit -m "Update sync state [skip ci]" || echo "No changes to commit"
-          git push
+          
+          # Only commit if git status shows modifications
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: Update sync state [skip ci]"
+            git push
+          else
+            echo "No changes to state.json to commit."
+          fi
