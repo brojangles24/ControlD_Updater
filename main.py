@@ -162,46 +162,69 @@ async def sync_single_profile(sem: asyncio.Semaphore, auth_client: httpx.AsyncCl
             new_hash = calculate_hash(remote)
             stored_hash = state[profile_id].get(name)
             
-            rules = [r["PK"] for r in remote.get("rules", []) if r.get("PK")]
+            # Extract folder-level default actions
+            action_data = group_data.get("action", {})
+            folder_do = int(action_data.get("do", group_data.get("do", 0)))
+            folder_status = int(action_data.get("status", group_data.get("status", 1)))
+            
+            raw_rules = remote.get("rules", [])
             
             if name in current_folders and stored_hash == new_hash:
                 log.info(f"⏩ [{name}] No changes. Skipping.")
                 continue
             
-            if current_rules + len(rules) > RULE_LIMIT:
-                log.error(f"❌ [{name}] Sync aborted. Adding {len(rules)} rules exceeds 10k limit.")
+            if current_rules + len(raw_rules) > RULE_LIMIT:
+                log.error(f"❌ [{name}] Sync aborted. Adding {len(raw_rules)} rules exceeds 10k limit.")
                 continue
 
             log.info(f"🔄 [{name}] Update detected. Executing zero-downtime swap...")
             
-            action_data = group_data.get("action", {})
-            do_action = action_data.get("do", group_data.get("do", 0))
-            status = action_data.get("status", group_data.get("status", 1))
-            
+            # --- Sort rules into action buckets ---
+            action_buckets = {}
+            for r in raw_rules:
+                hostname = r.get("PK")
+                if not hostname:
+                    continue
+                
+                # If rule has its own action, use it; otherwise inherit folder's action
+                r_action = r.get("action", {})
+                r_do = int(r_action.get("do", folder_do))
+                r_status = int(r_action.get("status", folder_status))
+                
+                key = (r_do, r_status)
+                if key not in action_buckets:
+                    action_buckets[key] = []
+                action_buckets[key].append(hostname)
+
             temp_name = f"{name}_tmp"
 
             try:
+                # 1. Create Temp Group
                 await _retry_request(lambda: auth_client.post(
                     f"{API_BASE}/profiles/{profile_id}/groups", 
-                    json={"name": temp_name, "do": int(do_action), "status": int(status)}
+                    json={"name": temp_name, "do": folder_do, "status": folder_status}
                 ))
                 
                 updated_folders = await list_folders(auth_client, profile_id)
                 new_id = updated_folders.get(temp_name)
                 
                 if new_id:
-                    await push_rules(auth_client, profile_id, temp_name, new_id, do_action, status, rules)
+                    # 2. Push rules from each bucket
+                    for (b_do, b_status), hostnames in action_buckets.items():
+                        await push_rules(auth_client, profile_id, temp_name, new_id, b_do, b_status, hostnames)
                     
+                    # 3. Delete Old Group
                     if name in current_folders:
                         await _retry_request(lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[name]}"))
 
+                    # 4. Rename Temp Group to Original Name
                     await _retry_request(lambda: auth_client.put(
                         f"{API_BASE}/profiles/{profile_id}/groups/{new_id}",
                         json={"name": name}
                     ))
 
                     state[profile_id][name] = new_hash
-                    log.info(f"✅ [{name}] Synced.")
+                    log.info(f"✅ [{name}] Synced with {len(action_buckets)} action types.")
                 else:
                     log.error(f"❌ [{name}] Failed to verify temp folder creation.")
 
