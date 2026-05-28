@@ -31,13 +31,22 @@ MAX_RETRIES = 3
 CONCURRENCY_LIMIT = 5 
 RULE_LIMIT = 10000
 
-# Safely hardcode your profile names here (case-insensitive)
-EXCLUDED_PROFILES = [
-    "iot",
-    "main", 
-    "user i",
-    "user k"
-]
+# Explicit mapping of public pseudonyms to incoming environment variables
+PROFILE_MAPPING = {
+    "guest": os.getenv("GUEST"),
+    "iot": os.getenv("IOT"),
+    "main": os.getenv("MAIN"),
+    "user_i": os.getenv("USER_I"),
+    "user_k": os.getenv("USER_K"),
+}
+
+# TOGGLE EXCLUSIONS HERE: Simply add or remove strings from this list
+EXCLUDED_PROFILES = ["iot", "main"]
+
+# Resolve chosen pseudonyms down to the actual hidden IDs
+EXCLUDED_IDS = {
+    PROFILE_MAPPING[p] for p in EXCLUDED_PROFILES if PROFILE_MAPPING.get(p)
+}
 
 # --------------------------------------------------------------------------- #
 # 1. State Management
@@ -96,11 +105,11 @@ async def fetch_gh_json(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
     resp.raise_for_status()
     return resp.json()
 
-async def get_all_profiles(sem: asyncio.Semaphore, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+async def get_all_profiles(sem: asyncio.Semaphore, client: httpx.AsyncClient) -> List[str]:
     try:
         resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles"))
         data = resp.json()
-        return data.get("body", {}).get("profiles", [])
+        return [p["PK"] for p in data.get("body", {}).get("profiles", [])]
     except Exception:
         return []
 
@@ -290,12 +299,8 @@ async def main_async():
                 log.warning("No valid blocklist data found.")
                 return
 
-            # Fetch profiles and safely filter by friendly name strings
-            all_profiles = await get_all_profiles(api_sem, auth_client)
-            pids = [
-                p["PK"] for p in all_profiles 
-                if p.get("name", "").strip().lower() not in EXCLUDED_PROFILES
-            ]
+            all_profile_ids = await get_all_profiles(api_sem, auth_client)
+            pids = [pid for pid in all_profile_ids if pid not in EXCLUDED_IDS]
             
             await asyncio.gather(*(
                 sync_single_profile(profile_sem, api_sem, auth_client, pid, valid_remote_data, state) 
