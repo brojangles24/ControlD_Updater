@@ -1,3 +1,5 @@
+analytics_cluster = "america.analytics.controld.com"
+
 batch_size = 200
 concurrency_limit = 5
 rule_limit = 10000
