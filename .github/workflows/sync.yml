@@ -1,4 +1,5 @@
-name: Control D BAAAAAABY
+name: Control D Sync
+
 on:
   schedule:
     - cron: '17 5 * * *'
