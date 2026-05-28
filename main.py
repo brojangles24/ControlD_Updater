@@ -31,10 +31,12 @@ MAX_RETRIES = 3
 CONCURRENCY_LIMIT = 5 
 RULE_LIMIT = 10000
 
+# Safely hardcode your profile names here (case-insensitive)
 EXCLUDED_PROFILES = [
-    "793407laxinb",
-    "712995laxgov", 
-    "789687laxwlw"
+    "iot",
+    "main", 
+    "user i",
+    "user k"
 ]
 
 # --------------------------------------------------------------------------- #
@@ -94,11 +96,11 @@ async def fetch_gh_json(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
     resp.raise_for_status()
     return resp.json()
 
-async def get_all_profiles(sem: asyncio.Semaphore, client: httpx.AsyncClient) -> List[str]:
+async def get_all_profiles(sem: asyncio.Semaphore, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     try:
         resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles"))
         data = resp.json()
-        return [p["PK"] for p in data.get("body", {}).get("profiles", [])]
+        return data.get("body", {}).get("profiles", [])
     except Exception:
         return []
 
@@ -252,11 +254,9 @@ async def main_async():
     state = load_state()
 
     try:
-        # High Performance: Enabled http2 support across both clients
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60, http2=True) as auth_client, \
                    httpx.AsyncClient(timeout=60, http2=True) as gh_client:
             
-            # Rate Limiting Guard: Enforce strict total out-flight HTTP requests
             api_sem = asyncio.Semaphore(10)
             profile_sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
@@ -264,7 +264,6 @@ async def main_async():
             gh_tasks = [fetch_gh_json(gh_client, url) for url in FOLDER_URLS]
             results = await asyncio.gather(*gh_tasks, return_exceptions=True)
             
-            # Compute Buckets Globally: Parse and calculate hashes/buckets exactly once
             valid_remote_data = []
             for r in results:
                 if not isinstance(r, dict):
@@ -291,7 +290,12 @@ async def main_async():
                 log.warning("No valid blocklist data found.")
                 return
 
-            pids = [p for p in await get_all_profiles(api_sem, auth_client) if p not in EXCLUDED_PROFILES]
+            # Fetch profiles and safely filter by friendly name strings
+            all_profiles = await get_all_profiles(api_sem, auth_client)
+            pids = [
+                p["PK"] for p in all_profiles 
+                if p.get("name", "").strip().lower() not in EXCLUDED_PROFILES
+            ]
             
             await asyncio.gather(*(
                 sync_single_profile(profile_sem, api_sem, auth_client, pid, valid_remote_data, state) 
