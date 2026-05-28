@@ -1,8 +1,6 @@
-name: Control D Sync
-
+name: Control D BAAAAAABY
 on:
   schedule:
-    # OFFSET CRON: Runs every day at 05:17 UTC to avoid GitHub's top-of-the-hour queue delays.
     - cron: '17 5 * * *'
   workflow_dispatch:
 
@@ -12,7 +10,6 @@ jobs:
     permissions:
       contents: write
     
-    # Prevents overlapping runs if a previous sync hung
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
@@ -25,7 +22,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # Speeds up future runs by caching dependencies
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
@@ -34,6 +31,11 @@ jobs:
       - name: Run Sync Script
         env:
           TOKEN: ${{ secrets.CONTROLD_TOKEN }} 
+          GUEST: ${{ secrets.GUEST }}
+          IOT: ${{ secrets.IOT }}
+          MAIN: ${{ secrets.MAIN }}
+          USER_I: ${{ secrets.USER_I }}
+          USER_K: ${{ secrets.USER_K }}
         run: python main.py
 
       - name: Commit and Push State
@@ -42,7 +44,6 @@ jobs:
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add state.json
           
-          # Only commit if git status shows modifications
           if ! git diff --staged --quiet; then
             git commit -m "chore: Update sync state [skip ci]"
             git push
