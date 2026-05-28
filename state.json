@@ -1,8 +1,10 @@
 {
   "main": {
+    "Badware Hoster": "055db9ef5dda143e9dbe883073dd65891b4656c4712192300553d51d5ef2ee22",
     "Most Abused TLDs": "bb2fe2d20ec158c5cf70d7ee7b3159853da4f3d76b51b58e68d58f458b03293e"
   },
   "user_i": {
-    "Most Abused TLDs": "bb2fe2d20ec158c5cf70d7ee7b3159853da4f3d76b51b58e68d58f458b03293e"
+    "Most Abused TLDs": "bb2fe2d20ec158c5cf70d7ee7b3159853da4f3d76b51b58e68d58f458b03293e",
+    "Spam TLDs Combined": "bb2fe2d20ec158c5cf70d7ee7b3159853da4f3d76b51b58e68d58f458b03293e"
   }
 }
