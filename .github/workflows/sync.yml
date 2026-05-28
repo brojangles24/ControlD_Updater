@@ -22,7 +22,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Removed the cache line from here
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -42,6 +42,7 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          # Ensures both the state tracker and the dashboard are committed
           git add state.json README.md
           
           if ! git diff --staged --quiet; then
