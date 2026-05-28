@@ -41,7 +41,7 @@ PROFILE_MAPPING = {
 }
 
 # TOGGLE EXCLUSIONS HERE: Simply add or remove strings from this list
-EXCLUDED_PROFILES = ["iot", "main", "user_k"]
+EXCLUDED_PROFILES = ["iot", "guest", "user_k"]
 
 # Resolve chosen pseudonyms down to the actual hidden IDs
 EXCLUDED_IDS = {
