@@ -31,7 +31,8 @@ TOKEN = os.getenv("TOKEN")
 STATE_FILE = "state.json"
 
 BATCH_SIZE = config.get("batch_size", 200)
-CONCURRENCY_LIMIT = config.get("concurrency_limit", 5)
+# Lowered concurrency to prevent Control D API rate limits/timeouts during heavy pushes
+CONCURRENCY_LIMIT = config.get("concurrency_limit", 3) 
 RULE_LIMIT = config.get("rule_limit", 10000)
 RULES_CONFIG = config.get("rules", [])
 
@@ -108,43 +109,70 @@ async def get_rule_count(sem: asyncio.Semaphore, client: httpx.AsyncClient, prof
     except Exception:
         return 0
 
+async def get_profile_blocked_count(sem: asyncio.Semaphore, client: httpx.AsyncClient, profile_id: str) -> str:
+    try:
+        resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles/{profile_id}/analytics"))
+        data = resp.json()
+        stats = data.get("body", {}).get("stats", {})
+        blocked = stats.get("blocked", 0)
+        return f"{blocked:,}"
+    except Exception as e:
+        log.debug(f"Could not fetch analytics for {profile_id}: {e}")
+        return "N/A"
+
 async def push_rules(api_sem: asyncio.Semaphore, client: httpx.AsyncClient, profile_id: str, folder_name: str, folder_id: str, do: int, status: int, hostnames: List[str]):
     batches = [hostnames[i:i + BATCH_SIZE] for i in range(0, len(hostnames), BATCH_SIZE)]
     
     async def send_batch(batch: List[str], is_first: bool):
         payload = {"do": int(do), "status": int(status), "group": str(folder_id), "hostnames": batch}
-        if is_first:
-            for attempt in range(5):
-                try:
-                    async with api_sem:
-                        resp = await client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=payload)
-                    resp.raise_for_status()
-                    return
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 404:
-                        await asyncio.sleep(1)
-                        continue
-                    raise e
-        else:
+        
+        max_attempts = 5 if is_first else 3
+        for attempt in range(max_attempts):
             try:
-                await _retry_request(api_sem, lambda: client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=payload))
+                async with api_sem:
+                    resp = await client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=payload)
+                resp.raise_for_status()
+                return # Success
             except httpx.HTTPStatusError as e:
+                # Group propagation delay
+                if is_first and e.response.status_code == 404:
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Rule rejection (Invalid Domain or Hard Limit)
                 if e.response.status_code == 400:
-                    log.warning(f"⚠️ [{folder_name}] Batch failed. Retrying entries individually...")
-                    fallback_tasks = []
-                    for h in batch:
-                        single_payload = {**payload, "hostnames": [h]}
-                        async def send_single(p):
-                            async with api_sem:
-                                try:
-                                    await client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=p)
-                                except Exception as ex:
-                                    log.debug(f"Failed to push single hostname {h}: {ex}")
-                        fallback_tasks.append(send_single(single_payload))
-                    await asyncio.gather(*fallback_tasks)
+                    try:
+                        err_msg = e.response.json().get("error", {}).get("message", "").lower()
+                        if "limit" in err_msg:
+                            log.error(f"❌ Hard API Limit Reached! Cannot push batch to {folder_name}.")
+                            raise e 
+                    except Exception:
+                        pass
+                    
+                    # It's an invalid domain rejection, break loop to trigger individual fallback
+                    break
+                    
+                if attempt == max_attempts - 1:
+                    raise e
+                await asyncio.sleep(1)
+
+        # Fallback: Push individually to isolate and drop bad domains
+        log.debug(f"⚠️ [{folder_name}] Batch rejected. Filtering invalid entries individually...")
+        fallback_tasks = []
+        for h in batch:
+            single_payload = {**payload, "hostnames": [h]}
+            async def send_single(p):
+                async with api_sem:
+                    try:
+                        await client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=p)
+                    except Exception:
+                        pass # Silently drop invalid domains
+            fallback_tasks.append(send_single(single_payload))
+        await asyncio.gather(*fallback_tasks)
 
     if not batches:
         return
+    
     await send_batch(batches[0], is_first=True)
     if len(batches) > 1:
         tasks = [send_batch(b, is_first=False) for b in batches[1:]]
@@ -166,7 +194,6 @@ async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.
         current_rules = await get_rule_count(api_sem, auth_client, profile_id)
         current_folders = await list_folders(api_sem, auth_client, profile_id)
         
-        # FIXED: Track using the public pseudonym string instead of the raw profile_id
         if profile_pseudonym not in state:
             state[profile_pseudonym] = {}
 
@@ -178,14 +205,22 @@ async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.
             log.error(f"❌ [{name}] -> ({profile_pseudonym}) Sync aborted. Exceeds 10k limit.")
             return
 
-        log.info(f"⚡ [{name}] -> ({profile_pseudonym}) executing zero-downtime swap...")
         temp_name = f"{name}_tmp"
 
+        # PRE-CLEANUP: If a previous script run crashed and orphaned a _tmp folder, nuke it first.
+        if temp_name in current_folders:
+            log.warning(f"🧹 Removing stranded '{temp_name}' from a previous failed run...")
+            try:
+                await _retry_request(api_sem, lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[temp_name]}"))
+            except Exception:
+                pass
+
+        log.info(f"⚡ [{name}] -> ({profile_pseudonym}) executing zero-downtime swap...")
         try:
             # 1. Create Temp Group
             await _retry_request(api_sem, lambda: auth_client.post(
                 f"{API_BASE}/profiles/{profile_id}/groups", json={"name": temp_name}
-                ))
+            ))
             
             updated_folders = await list_folders(api_sem, auth_client, profile_id)
             new_id = updated_folders.get(temp_name)
@@ -207,7 +242,6 @@ async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.
                     f"{API_BASE}/profiles/{profile_id}/groups/{new_id}", json={"name": name}
                 ))
 
-                # FIXED: Save state hash under the clean profile alias 
                 state[profile_pseudonym][name] = new_hash
                 log.info(f"✅ [{name}] -> ({profile_pseudonym}) Sync complete.")
             else:
@@ -224,14 +258,14 @@ async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.
             except Exception:
                 pass
 
-def update_readme_dashboard(active_profiles: dict, rules_config: list, url_cache: dict):
+def update_readme_dashboard(active_profiles: dict, rules_config: list, url_cache: dict, stats_cache: dict):
     readme_path = "README.md"
     if not os.path.exists(readme_path):
         return
 
-    markdown_content = "\n### Current Rule Deployments\n\n"
-    markdown_content += "| Profile Alias | Rule Name | Enforced Action | Status |\n"
-    markdown_content += "| :--- | :--- | :--- | :--- |\n"
+    markdown_content = "\n### Current Rule Deployments & Stats\n\n"
+    markdown_content += "| Profile Alias | Rule Name | Enforced Action | Blocked Queries | Status |\n"
+    markdown_content += "| :--- | :--- | :--- | :--- | :--- |\n"
 
     for r_item in rules_config:
         rule_name = r_item.get("rule", "Unnamed Rule")
@@ -244,11 +278,13 @@ def update_readme_dashboard(active_profiles: dict, rules_config: list, url_cache
         rule_count = cache_hit["rule_count"] if cache_hit else 0
         
         for pseud in active_profiles.keys():
+            blocked_amount = stats_cache.get(pseud, "N/A")
+
             if pseud in excluded:
-                markdown_content += f"| `{pseud}` | {display_name} | `{profile_rule}` | ⏩ *Excluded* |\n"
+                markdown_content += f"| `{pseud}` | {display_name} | `{profile_rule}` | - | ⏩ *Excluded* |\n"
             else:
                 status_text = f"✅ **Active** ({rule_count:,} rules)" if rule_count else "✅ **Active**"
-                markdown_content += f"| `{pseud}` | {display_name} | `{profile_rule}` | {status_text} |\n"
+                markdown_content += f"| `{pseud}` | {display_name} | `{profile_rule}` | **{blocked_amount}** | {status_text} |\n"
 
     try:
         with open(readme_path, "r", encoding="utf-8") as f:
@@ -264,7 +300,7 @@ def update_readme_dashboard(active_profiles: dict, rules_config: list, url_cache
             
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write(updated_readme)
-            log.info("📝 README.md live status dashboard refreshed.")
+            log.info("📝 README.md live status dashboard refreshed with analytics.")
     except Exception as e:
         log.error(f"⚠️ Failed to write update to README dashboard: {e}")
 
@@ -292,10 +328,12 @@ async def main_async():
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60, http2=True) as auth_client, \
                    httpx.AsyncClient(timeout=60, http2=True) as gh_client:
             
-            api_sem = asyncio.Semaphore(10)
+            # Dropped concurrency from 10 to 5 to protect against API timeouts
+            api_sem = asyncio.Semaphore(5) 
             profile_sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
             sync_tasks = []
+            url_cache = {}
 
             for r_item in RULES_CONFIG:
                 url = r_item.get("rule_url")
@@ -315,7 +353,10 @@ async def main_async():
                     continue
 
                 raw_rules = parsed_json.get("rules", [])
-                folder_display_name = parsed_json.get("group", {}).get("group", rule_name).strip()
+                
+                # FORCE TOML PREFERENCE: Use TOML name first. Fallback to JSON internal name only if missing.
+                json_internal_name = parsed_json.get("group", {}).get("group", "Unnamed Folder")
+                folder_display_name = r_item.get("rule", json_internal_name).strip()
                 action_buckets = {}
 
                 for rule in raw_rules:
@@ -341,6 +382,8 @@ async def main_async():
                     "rule_count": len(raw_rules),
                     "action_buckets": action_buckets
                 }
+                
+                url_cache[url] = rule_payload
 
                 for pseud, pid in active_profiles.items():
                     if pseud in excluded:
@@ -354,7 +397,12 @@ async def main_async():
             if sync_tasks:
                 await asyncio.gather(*sync_tasks)
 
-            update_readme_dashboard(active_profiles, RULES_CONFIG, {})
+            log.info("📊 Fetching daily analytics for dashboard...")
+            stats_cache = {}
+            for pseud, pid in active_profiles.items():
+                stats_cache[pseud] = await get_profile_blocked_count(api_sem, auth_client, pid)
+
+            update_readme_dashboard(active_profiles, RULES_CONFIG, url_cache, stats_cache)
     finally:
         save_state(state)
 
