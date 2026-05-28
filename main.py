@@ -3,12 +3,13 @@ import json
 import logging
 import asyncio
 import hashlib
+import tomllib
 from typing import Dict, List, Any
 
 import httpx
 
 # --------------------------------------------------------------------------- #
-# 0. Config
+# 0. Load Configuration from TOML
 # --------------------------------------------------------------------------- #
 logging.basicConfig(
     level=logging.INFO,
@@ -18,35 +19,21 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("control-d-sync")
 
+try:
+    with open("config.toml", "rb") as f:
+        config = tomllib.load(f)
+except Exception as e:
+    log.error(f"❌ Critical error loading config.toml: {e}")
+    exit(1)
+
 API_BASE = "https://api.controld.com"
 TOKEN = os.getenv("TOKEN")
 STATE_FILE = "state.json"
 
-FOLDER_URLS = [
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/spam-tlds-combined-folder.json",
-]
-
-BATCH_SIZE = 200
-MAX_RETRIES = 3
-CONCURRENCY_LIMIT = 5 
-RULE_LIMIT = 10000
-
-# Explicit mapping of public pseudonyms to incoming environment variables
-PROFILE_MAPPING = {
-    "guest": os.getenv("GUEST"),
-    "iot": os.getenv("IOT"),
-    "main": os.getenv("MAIN"),
-    "user_i": os.getenv("USER_I"),
-    "user_k": os.getenv("USER_K"),
-}
-
-# TOGGLE EXCLUSIONS HERE: Simply add or remove strings from this list
-EXCLUDED_PROFILES = ["iot", "guest", "user_k"]
-
-# Resolve chosen pseudonyms down to the actual hidden IDs
-EXCLUDED_IDS = {
-    PROFILE_MAPPING[p] for p in EXCLUDED_PROFILES if PROFILE_MAPPING.get(p)
-}
+BATCH_SIZE = config.get("batch_size", 200)
+CONCURRENCY_LIMIT = config.get("concurrency_limit", 5)
+RULE_LIMIT = config.get("rule_limit", 10000)
+RULES_CONFIG = config.get("rules", [])
 
 # --------------------------------------------------------------------------- #
 # 1. State Management
@@ -73,8 +60,10 @@ def save_state(state: Dict):
         if os.path.exists(tmp_file):
             os.remove(tmp_file)
 
-def calculate_hash(data: Dict) -> str:
-    serialized = json.dumps(data, sort_keys=True).encode('utf-8')
+def calculate_hash(data: Dict, profile_rule: str) -> str:
+    # Include profile_rule modifier in the hash calculation to force sync if action toggles
+    payload = {"data": data, "profile_rule": profile_rule}
+    serialized = json.dumps(payload, sort_keys=True).encode('utf-8')
     return hashlib.sha256(serialized).hexdigest()
 
 # --------------------------------------------------------------------------- #
@@ -83,7 +72,7 @@ def calculate_hash(data: Dict) -> str:
 
 async def _retry_request(sem: asyncio.Semaphore, request_func):
     async with sem:
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(3):
             try:
                 response = await request_func()
                 response.raise_for_status()
@@ -91,27 +80,18 @@ async def _retry_request(sem: asyncio.Semaphore, request_func):
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in [400, 401]:
                     raise
-                if attempt == MAX_RETRIES - 1:
+                if attempt == 2:
                     log.error(f"❌ API Error: {e.response.text}")
                     raise
             except (httpx.ConnectError, httpx.TimeoutException):
-                if attempt == MAX_RETRIES - 1:
+                if attempt == 2:
                     raise
-            
             await asyncio.sleep(1 * (2 ** attempt))
 
 async def fetch_gh_json(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
     resp = await client.get(url)
     resp.raise_for_status()
     return resp.json()
-
-async def get_all_profiles(sem: asyncio.Semaphore, client: httpx.AsyncClient) -> List[str]:
-    try:
-        resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles"))
-        data = resp.json()
-        return [p["PK"] for p in data.get("body", {}).get("profiles", [])]
-    except Exception:
-        return []
 
 async def list_folders(sem: asyncio.Semaphore, client: httpx.AsyncClient, profile_id: str) -> Dict[str, str]:
     try:
@@ -133,12 +113,7 @@ async def push_rules(api_sem: asyncio.Semaphore, client: httpx.AsyncClient, prof
     batches = [hostnames[i:i + BATCH_SIZE] for i in range(0, len(hostnames), BATCH_SIZE)]
     
     async def send_batch(batch: List[str], is_first: bool):
-        payload = {
-            "do": int(do),
-            "status": int(status),
-            "group": str(folder_id),
-            "hostnames": batch
-        }
+        payload = {"do": int(do), "status": int(status), "group": str(folder_id), "hostnames": batch}
         if is_first:
             for attempt in range(5):
                 try:
@@ -171,89 +146,82 @@ async def push_rules(api_sem: asyncio.Semaphore, client: httpx.AsyncClient, prof
 
     if not batches:
         return
-
     await send_batch(batches[0], is_first=True)
-
     if len(batches) > 1:
         tasks = [send_batch(b, is_first=False) for b in batches[1:]]
         await asyncio.gather(*tasks)
 
 # --------------------------------------------------------------------------- #
-# 3. Main Sync Logic
+# 3. Core Sync Logic
 # --------------------------------------------------------------------------- #
 
-async def sync_single_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.Semaphore, auth_client: httpx.AsyncClient, profile_id: str, remote_data: List[Dict], state: Dict):
+async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.Semaphore, auth_client: httpx.AsyncClient, profile_id: str, profile_pseudonym: str, rule_payload: Dict, state: Dict):
     async with profile_sem:
-        log.info(f"--- Processing Profile: {profile_id} ---")
+        name = rule_payload["name"]
+        new_hash = rule_payload["hash"]
+        rule_count = rule_payload["rule_count"]
+        action_buckets = rule_payload["action_buckets"]
+
+        log.info(f"🔄 Processing [{name}] for profile: {profile_pseudonym}")
         
         current_rules = await get_rule_count(api_sem, auth_client, profile_id)
-        log.info(f"📊 Current Rule Count: {current_rules}/{RULE_LIMIT}")
-
         current_folders = await list_folders(api_sem, auth_client, profile_id)
         
         if profile_id not in state:
             state[profile_id] = {}
 
-        for remote_item in remote_data:
-            name = remote_item["name"]
-            new_hash = remote_item["hash"]
-            rule_count = remote_item["rule_count"]
-            action_buckets = remote_item["action_buckets"]
-            
-            if name in current_folders and state[profile_id].get(name) == new_hash:
-                log.info(f"⏩ [{name}] No changes. Skipping.")
-                continue
-            
-            if current_rules + rule_count > RULE_LIMIT:
-                log.error(f"❌ [{name}] Sync aborted. Adding {rule_count} rules exceeds 10k limit.")
-                continue
+        if name in current_folders and state[profile_id].get(name) == new_hash:
+            log.info(f"⏩ [{name}] -> ({profile_pseudonym}) No changes. Skipping.")
+            return
+        
+        if current_rules + rule_count > RULE_LIMIT:
+            log.error(f"❌ [{name}] -> ({profile_pseudonym}) Sync aborted. Exceeds 10k limit.")
+            return
 
-            log.info(f"🔄 [{name}] Update detected. Executing zero-downtime swap...")
-            temp_name = f"{name}_tmp"
+        log.info(f"⚡ [{name}] -> ({profile_pseudonym}) executing zero-downtime swap...")
+        temp_name = f"{name}_tmp"
 
-            try:
-                # 1. Create Temp Group
-                await _retry_request(api_sem, lambda: auth_client.post(
-                    f"{API_BASE}/profiles/{profile_id}/groups", 
-                    json={"name": temp_name}
+        try:
+            # 1. Create Temp Group
+            await _retry_request(api_sem, lambda: auth_client.post(
+                f"{API_BASE}/profiles/{profile_id}/groups", json={"name": temp_name}
                 ))
+            
+            updated_folders = await list_folders(api_sem, auth_client, profile_id)
+            new_id = updated_folders.get(temp_name)
+            
+            if new_id:
+                # 2. Push rules concurrently via action buckets
+                push_tasks = [
+                    push_rules(api_sem, auth_client, profile_id, temp_name, new_id, b_do, b_status, hostnames)
+                    for (b_do, b_status), hostnames in action_buckets.items()
+                ]
+                await asyncio.gather(*push_tasks)
                 
-                updated_folders = await list_folders(api_sem, auth_client, profile_id)
-                new_id = updated_folders.get(temp_name)
-                
-                if new_id:
-                    # 2. Push rules concurrently via action buckets
-                    push_tasks = [
-                        push_rules(api_sem, auth_client, profile_id, temp_name, new_id, b_do, b_status, hostnames)
-                        for (b_do, b_status), hostnames in action_buckets.items()
-                    ]
-                    await asyncio.gather(*push_tasks)
-                    
-                    # 3. Delete Old Group
-                    if name in current_folders:
-                        await _retry_request(api_sem, lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[name]}"))
+                # 3. Delete Old Group
+                if name in current_folders:
+                    await _retry_request(api_sem, lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{current_folders[name]}"))
 
-                    # 4. Rename Temp Group to Original Name
-                    await _retry_request(api_sem, lambda: auth_client.put(
-                        f"{API_BASE}/profiles/{profile_id}/groups/{new_id}",
-                        json={"name": name}
-                    ))
+                # 4. Rename Temp Group to Original Name
+                await _retry_request(api_sem, lambda: auth_client.put(
+                    f"{API_BASE}/profiles/{profile_id}/groups/{new_id}", json={"name": name}
+                ))
 
-                    state[profile_id][name] = new_hash
-                    log.info(f"✅ [{name}] Synced with {len(action_buckets)} action types.")
-                else:
-                    log.error(f"❌ [{name}] Failed to verify temp folder creation.")
+                state[profile_id][name] = new_hash
+                log.info(f"✅ [{name}] -> ({profile_pseudonym}) Sync complete.")
+            else:
+                log.error(f"❌ [{name}] -> ({profile_pseudonym}) Failed to verify temp folder creation.")
 
-            except Exception as e:
-                log.error(f"❌ [{name}] Sync failed: {e}")
-            finally:
-                try:
-                    cleanup_folders = await list_folders(api_sem, auth_client, profile_id)
-                    if temp_name in cleanup_folders:
-                        log.info(f"🧹 Cleaning up orphaned temp folder: {temp_name}")
-                        await _retry_request(api_sem, lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{cleanup_folders[temp_name]}"))
-                except Exception:
-                    pass
+        except Exception as e:
+            log.error(f"❌ [{name}] -> ({profile_pseudonym}) Sync failed: {e}")
+        finally:
+            try:
+                cleanup_folders = await list_folders(api_sem, auth_client, profile_id)
+                if temp_name in cleanup_folders:
+                    log.info(f"🧹 Cleaning up orphaned temp folder on {profile_pseudonym}")
+                    await _retry_request(api_sem, lambda: auth_client.delete(f"{API_BASE}/profiles/{profile_id}/groups/{cleanup_folders[temp_name]}"))
+            except Exception:
+                pass
 
 async def main_async():
     if not TOKEN:
@@ -262,6 +230,20 @@ async def main_async():
 
     state = load_state()
 
+    # Load dynamic environment credentials mapping
+    env_profiles = {
+        "guest": os.getenv("GUEST"),
+        "iot": os.getenv("IOT"),
+        "main": os.getenv("MAIN"),
+        "user_i": os.getenv("USER_I"),
+        "user_k": os.getenv("USER_K"),
+    }
+    active_profiles = {k: v for k, v in env_profiles.items() if v}
+
+    if not RULES_CONFIG:
+        log.info("⏩ No rules configured inside config.toml.")
+        return
+
     try:
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60, http2=True) as auth_client, \
                    httpx.AsyncClient(timeout=60, http2=True) as gh_client:
@@ -269,44 +251,66 @@ async def main_async():
             api_sem = asyncio.Semaphore(10)
             profile_sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-            log.info("📥 Fetching blocklists...")
-            gh_tasks = [fetch_gh_json(gh_client, url) for url in FOLDER_URLS]
-            results = await asyncio.gather(*gh_tasks, return_exceptions=True)
-            
-            valid_remote_data = []
-            for r in results:
-                if not isinstance(r, dict):
+            sync_tasks = []
+
+            for r_item in RULES_CONFIG:
+                url = r_item.get("rule_url")
+                rule_name = r_item.get("rule", "Unnamed Rule")
+                profile_rule = r_item.get("profile_rule", "none").strip().lower()
+                excluded = [p.strip().lower() for p in r_item.get("excluded_profiles", [])]
+
+                if not url:
+                    log.warning(f"⚠️ Rule configuration blocks missing 'rule_url'. Skipping.")
                     continue
-                
-                raw_rules = r.get("rules", [])
+
+                log.info(f"📥 Fetching blocklist source for: {rule_name}")
+                try:
+                    parsed_json = await fetch_gh_json(gh_client, url)
+                except Exception as e:
+                    log.error(f"❌ Failed to fetch dataset from source URL {url}: {e}")
+                    continue
+
+                # Parse and bucket data using the configured profile_rule rule system
+                raw_rules = parsed_json.get("rules", [])
+                folder_display_name = parsed_json.get("group", {}).get("group", rule_name).strip()
                 action_buckets = {}
+
                 for rule in raw_rules:
                     hostname = rule.get("PK")
                     if not hostname:
                         continue
-                    r_action = rule.get("action", {})
-                    key = (int(r_action.get("do", 0)), int(r_action.get("status", 1)))
+                    
+                    if profile_rule == "block":
+                        do, status = 0, 1
+                    elif profile_rule == "allow":
+                        do, status = 1, 1
+                    else:  # "none" -> Default layout values loaded from the source file
+                        r_action = rule.get("action", {})
+                        do = int(r_action.get("do", 0))
+                        status = int(r_action.get("status", 1))
+
+                    key = (do, status)
                     action_buckets.setdefault(key, []).append(hostname)
-                
-                valid_remote_data.append({
-                    "name": r.get("group", {}).get("group", "Unnamed Folder").strip(),
-                    "hash": calculate_hash(r),
+
+                rule_payload = {
+                    "name": folder_display_name,
+                    "hash": calculate_hash(parsed_json, profile_rule),
                     "rule_count": len(raw_rules),
                     "action_buckets": action_buckets
-                })
+                }
 
-            if not valid_remote_data:
-                log.warning("No valid blocklist data found.")
-                return
+                # Evaluate execution targets: Include everyone EXCEPT explicitly excluded pseudonyms
+                for pseud, pid in active_profiles.items():
+                    if pseud in excluded:
+                        log.info(f"⏩ Rule [{folder_display_name}] explicitly excludes profile: {pseud}. Skipping target.")
+                        continue
+                    
+                    sync_tasks.append(
+                        sync_rule_to_profile(profile_sem, api_sem, auth_client, pid, pseud, rule_payload, state)
+                    )
 
-            all_profile_ids = await get_all_profiles(api_sem, auth_client)
-            pids = [pid for pid in all_profile_ids if pid not in EXCLUDED_IDS]
-            
-            await asyncio.gather(*(
-                sync_single_profile(profile_sem, api_sem, auth_client, pid, valid_remote_data, state) 
-                for pid in pids
-            ))
-    
+            if sync_tasks:
+                await asyncio.gather(*sync_tasks)
     finally:
         save_state(state)
 
