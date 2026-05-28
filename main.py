@@ -61,7 +61,6 @@ def save_state(state: Dict):
             os.remove(tmp_file)
 
 def calculate_hash(data: Dict, profile_rule: str) -> str:
-    # Include profile_rule modifier in the hash calculation to force sync if action toggles
     payload = {"data": data, "profile_rule": profile_rule}
     serialized = json.dumps(payload, sort_keys=True).encode('utf-8')
     return hashlib.sha256(serialized).hexdigest()
@@ -167,10 +166,11 @@ async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.
         current_rules = await get_rule_count(api_sem, auth_client, profile_id)
         current_folders = await list_folders(api_sem, auth_client, profile_id)
         
-        if profile_id not in state:
-            state[profile_id] = {}
+        # FIXED: Track using the public pseudonym string instead of the raw profile_id
+        if profile_pseudonym not in state:
+            state[profile_pseudonym] = {}
 
-        if name in current_folders and state[profile_id].get(name) == new_hash:
+        if name in current_folders and state[profile_pseudonym].get(name) == new_hash:
             log.info(f"⏩ [{name}] -> ({profile_pseudonym}) No changes. Skipping.")
             return
         
@@ -207,7 +207,8 @@ async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.
                     f"{API_BASE}/profiles/{profile_id}/groups/{new_id}", json={"name": name}
                 ))
 
-                state[profile_id][name] = new_hash
+                # FIXED: Save state hash under the clean profile alias 
+                state[profile_pseudonym][name] = new_hash
                 log.info(f"✅ [{name}] -> ({profile_pseudonym}) Sync complete.")
             else:
                 log.error(f"❌ [{name}] -> ({profile_pseudonym}) Failed to verify temp folder creation.")
@@ -223,6 +224,50 @@ async def sync_rule_to_profile(profile_sem: asyncio.Semaphore, api_sem: asyncio.
             except Exception:
                 pass
 
+def update_readme_dashboard(active_profiles: dict, rules_config: list, url_cache: dict):
+    readme_path = "README.md"
+    if not os.path.exists(readme_path):
+        return
+
+    markdown_content = "\n### Current Rule Deployments\n\n"
+    markdown_content += "| Profile Alias | Rule Name | Enforced Action | Status |\n"
+    markdown_content += "| :--- | :--- | :--- | :--- |\n"
+
+    for r_item in rules_config:
+        rule_name = r_item.get("rule", "Unnamed Rule")
+        profile_rule = r_item.get("profile_rule", "none").upper()
+        url = r_item.get("rule_url")
+        excluded = [p.strip().lower() for p in r_item.get("excluded_profiles", [])]
+        
+        cache_hit = url_cache.get(url)
+        display_name = cache_hit["name"] if cache_hit else rule_name
+        rule_count = cache_hit["rule_count"] if cache_hit else 0
+        
+        for pseud in active_profiles.keys():
+            if pseud in excluded:
+                markdown_content += f"| `{pseud}` | {display_name} | `{profile_rule}` | ⏩ *Excluded* |\n"
+            else:
+                status_text = f"✅ **Active** ({rule_count:,} rules)" if rule_count else "✅ **Active**"
+                markdown_content += f"| `{pseud}` | {display_name} | `{profile_rule}` | {status_text} |\n"
+
+    try:
+        with open(readme_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        start_marker = ""
+        end_marker = ""
+
+        if start_marker in content and end_marker in content:
+            before = content.split(start_marker)[0]
+            after = content.split(end_marker)[1]
+            updated_readme = f"{before}{start_marker}\n{markdown_content}\n{end_marker}{after}"
+            
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(updated_readme)
+            log.info("📝 README.md live status dashboard refreshed.")
+    except Exception as e:
+        log.error(f"⚠️ Failed to write update to README dashboard: {e}")
+
 async def main_async():
     if not TOKEN:
         log.error("Missing TOKEN env var. Execution stopped.")
@@ -230,7 +275,6 @@ async def main_async():
 
     state = load_state()
 
-    # Load dynamic environment credentials mapping
     env_profiles = {
         "guest": os.getenv("GUEST"),
         "iot": os.getenv("IOT"),
@@ -270,7 +314,6 @@ async def main_async():
                     log.error(f"❌ Failed to fetch dataset from source URL {url}: {e}")
                     continue
 
-                # Parse and bucket data using the configured profile_rule rule system
                 raw_rules = parsed_json.get("rules", [])
                 folder_display_name = parsed_json.get("group", {}).get("group", rule_name).strip()
                 action_buckets = {}
@@ -284,7 +327,7 @@ async def main_async():
                         do, status = 0, 1
                     elif profile_rule == "allow":
                         do, status = 1, 1
-                    else:  # "none" -> Default layout values loaded from the source file
+                    else:
                         r_action = rule.get("action", {})
                         do = int(r_action.get("do", 0))
                         status = int(r_action.get("status", 1))
@@ -299,7 +342,6 @@ async def main_async():
                     "action_buckets": action_buckets
                 }
 
-                # Evaluate execution targets: Include everyone EXCEPT explicitly excluded pseudonyms
                 for pseud, pid in active_profiles.items():
                     if pseud in excluded:
                         log.info(f"⏩ Rule [{folder_display_name}] explicitly excludes profile: {pseud}. Skipping target.")
@@ -311,6 +353,8 @@ async def main_async():
 
             if sync_tasks:
                 await asyncio.gather(*sync_tasks)
+
+            update_readme_dashboard(active_profiles, RULES_CONFIG, {})
     finally:
         save_state(state)
 
