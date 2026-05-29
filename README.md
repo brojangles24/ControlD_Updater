@@ -5,6 +5,48 @@
 | Profile Alias | Total Queries | Blocked Queries | Block Rate |
 | :--- | :--- | :--- | :--- |
 | `guest` | 0 | 0 | 0.0% |
+| `iot` | 746 | 434 | 58.2% |
+| `main` | 385 | 286 | 74.3% |
+| `user_i` | 264 | 118 | 44.7% |
+| `user_k` | 503 | 35 | 7.0% |
+
+<br>
+
+### 🛡️ Current Rule Deployments
+
+#### 📁 Spam TLDs Combined
+**Enforced Action:** `NONE`
+
+| Profile Alias | Status |
+| :--- | :--- |
+| `guest` | ⏩ *Excluded* |
+| `iot` | ⏩ *Excluded* |
+| `main` | ✅ **Active** (1,409 rules) |
+| `user_i` | ✅ **Active** (1,409 rules) |
+| `user_k` | ⏩ *Excluded* |
+
+<br>
+
+#### 📁 Badware Hoster
+**Enforced Action:** `NONE`
+
+| Profile Alias | Status |
+| :--- | :--- |
+| `guest` | ⏩ *Excluded* |
+| `iot` | ⏩ *Excluded* |
+| `main` | ✅ **Active** (1,025 rules) |
+| `user_i` | ✅ **Active** (1,025 rules) |
+| `user_k` | ⏩ *Excluded* |
+
+<br>
+
+
+
+### 📊 Profile Analytics (Last Hour)
+
+| Profile Alias | Total Queries | Blocked Queries | Block Rate |
+| :--- | :--- | :--- | :--- |
+| `guest` | 0 | 0 | 0.0% |
 | `iot` | 811 | 602 | 74.2% |
 | `main` | 459 | 332 | 72.3% |
 | `user_i` | 1,905 | 571 | 30.0% |
