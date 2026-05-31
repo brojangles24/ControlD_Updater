@@ -236,78 +236,6 @@ async def sync_rule_to_profile(api_sem: asyncio.Semaphore, auth_client: httpx.As
         except Exception:
             pass
 
-def update_readme_dashboard(active_profiles: dict, rules_config: list, url_cache: dict, stats_cache: dict, cluster_configured: bool):
-    readme_path = "README.md"
-    if not os.path.exists(readme_path):
-        return
-
-    markdown_content = ""
-
-    # Generate the 1-Hour Stats Block
-    if cluster_configured:
-        markdown_content += "\n### 📊 Profile Analytics (Last Hour)\n\n"
-        markdown_content += "| Profile Alias | Total Queries | Blocked Queries | Block Rate |\n"
-        markdown_content += "| :--- | :--- | :--- | :--- |\n"
-        
-        for pseud in sorted(active_profiles.keys()):
-            stats = stats_cache.get(pseud, {})
-            t = stats.get("total", 0)
-            b = stats.get("blocked", 0)
-            
-            rate = f"{(b/t)*100:.1f}%" if t > 0 else "0.0%"
-            markdown_content += f"| `{pseud}` | {t:,} | {b:,} | {rate} |\n"
-            
-        markdown_content += "\n<br>\n\n"
-
-    # Generate the Rule Configurations Block
-    markdown_content += "### 🛡️ Current Rule Deployments\n\n"
-
-    for r_item in rules_config:
-        rule_name = r_item.get("rule", "Unnamed Rule")
-        profile_rule = r_item.get("profile_rule", "none").upper()
-        url = r_item.get("rule_url")
-        excluded = [p.strip().lower() for p in r_item.get("excluded_profiles", [])]
-        
-        cache_hit = url_cache.get(url)
-        display_name = cache_hit["name"] if cache_hit else rule_name
-        rule_count = cache_hit["rule_count"] if cache_hit else 0
-        
-        markdown_content += f"#### 📁 {display_name}\n"
-        markdown_content += f"**Enforced Action:** `{profile_rule}`\n\n"
-        markdown_content += "| Profile Alias | Status |\n"
-        markdown_content += "| :--- | :--- |\n"
-        
-        for pseud in sorted(active_profiles.keys()):
-            if pseud in excluded:
-                markdown_content += f"| `{pseud}` | ⏩ *Excluded* |\n"
-            else:
-                status_text = f"✅ **Active** ({rule_count:,} rules)" if rule_count else "✅ **Active**"
-                markdown_content += f"| `{pseud}` | {status_text} |\n"
-        
-        markdown_content += "\n<br>\n\n"
-
-    # Inject into README
-    try:
-        with open(readme_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        start_marker = ""
-        end_marker = ""
-
-        start_idx = content.find(start_marker)
-        end_idx = content.find(end_marker)
-
-        if start_idx != -1 and end_idx != -1:
-            before = content[:start_idx]
-            after = content[end_idx + len(end_marker):]
-            updated_readme = f"{before}{start_marker}\n{markdown_content}{end_marker}{after}"
-            
-            with open(readme_path, "w", encoding="utf-8") as f:
-                f.write(updated_readme)
-            log.info("📝 README.md live status dashboard refreshed.")
-    except Exception as e:
-        log.error(f"⚠️ Failed to write update to README dashboard: {e}")
-
 async def main_async():
     if not TOKEN:
         log.error("Missing TOKEN env var. Execution stopped.")
@@ -433,7 +361,6 @@ async def main_async():
             else:
                 log.info("⏩ No 'analytics_cluster' defined in config.toml. Skipping stats fetch.")
 
-            update_readme_dashboard(active_profiles, RULES_CONFIG, url_cache, stats_cache, bool(ANALYTICS_CLUSTER))
     finally:
         save_state(state)
 
