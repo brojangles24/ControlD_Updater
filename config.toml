@@ -5,7 +5,7 @@ concurrency_limit = 5
 rule_limit = 10000
 
 [[rules]]
-rule = "Spam TLDs"
+rule = "Spam TLDs/IDNs"
 profile_rule = "none" # options: block, allow, none (none uses the JSON's internal actions)
 excluded_profiles = ["iot", "guest", "user_k"]
 rule_url = [
