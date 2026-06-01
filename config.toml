@@ -5,10 +5,10 @@ concurrency_limit = 5
 rule_limit = 10000
 
 [[rules]]
-rule = "Spam TLDs Combined"
+rule = "Spam TLDs"
 profile_rule = "none" # options: block, allow, none (none uses the JSON's internal actions)
 excluded_profiles = ["iot", "guest", "user_k"]
-rule_url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/spam-tlds-combined-folder.json"
+rule_url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/spam-tlds-folder.json"
 
 #[[rules]]
 #rule = "Badware Hoster"
