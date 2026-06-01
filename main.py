@@ -63,8 +63,9 @@ def save_state(state: Dict):
         if os.path.exists(tmp_file):
             os.remove(tmp_file)
 
-def calculate_hash(data: Dict, profile_rule: str) -> str:
-    payload = {"data": data, "profile_rule": profile_rule}
+def calculate_hash(combined_data: List[Dict], profile_rule: str) -> str:
+    # Hash the structure of all aggregated JSON sets combined
+    payload = {"data": combined_data, "profile_rule": profile_rule}
     serialized = json.dumps(payload, sort_keys=True).encode('utf-8')
     return hashlib.sha256(serialized).hexdigest()
 
@@ -261,30 +262,47 @@ async def main_async():
                    httpx.AsyncClient(timeout=60, http2=True) as gh_client:
             
             api_sem = asyncio.Semaphore(5) 
-            url_cache = {}
-
             rule_payloads = []
+
             for r_item in RULES_CONFIG:
-                url = r_item.get("rule_url")
+                raw_url_input = r_item.get("rule_url")
                 rule_name = r_item.get("rule", "Unnamed Rule")
                 profile_rule = r_item.get("profile_rule", "none").strip().lower()
 
-                if not url:
+                if not raw_url_input:
                     continue
 
-                log.info(f"📥 Fetching blocklist source for: {rule_name}")
-                try:
-                    parsed_json = await fetch_gh_json(gh_client, url)
-                except Exception as e:
-                    log.error(f"❌ Failed to fetch dataset from source URL {url}: {e}")
+                # Normalize single strings into an array so iteration always works
+                urls = [raw_url_input] if isinstance(raw_url_input, str) else raw_url_input
+
+                combined_raw_rules = []
+                combined_jsons_for_hash = []
+                fallback_folder_name = "Unnamed Folder"
+                fetch_failed = False
+
+                for url in urls:
+                    log.info(f"📥 Fetching blocklist source for: {rule_name} -> {url}")
+                    try:
+                        parsed_json = await fetch_gh_json(gh_client, url)
+                        combined_jsons_for_hash.append(parsed_json)
+                        
+                        # Accumulate rules across files
+                        combined_raw_rules.extend(parsed_json.get("rules", []))
+                        
+                        if "group" in parsed_json and "group" in parsed_json["group"]:
+                            fallback_folder_name = parsed_json["group"]["group"]
+                    except Exception as e:
+                        log.error(f"❌ Failed to fetch dataset from source URL {url}: {e}")
+                        fetch_failed = True
+                        break # Abort this specific rule sync if any internal URL chunks fail
+
+                if fetch_failed or not combined_raw_rules:
                     continue
 
-                raw_rules = parsed_json.get("rules", [])
-                json_internal_name = parsed_json.get("group", {}).get("group", "Unnamed Folder")
-                folder_display_name = r_item.get("rule", json_internal_name).strip()
+                folder_display_name = r_item.get("rule", fallback_folder_name).strip()
                 action_buckets = {}
 
-                for rule in raw_rules:
+                for rule in combined_raw_rules:
                     hostname = rule.get("PK")
                     if not hostname:
                         continue
@@ -304,12 +322,11 @@ async def main_async():
                 payload = {
                     "config_item": r_item,
                     "name": folder_display_name,
-                    "hash": calculate_hash(parsed_json, profile_rule),
-                    "rule_count": len(raw_rules),
+                    "hash": calculate_hash(combined_jsons_for_hash, profile_rule),
+                    "rule_count": len(combined_raw_rules),
                     "action_buckets": action_buckets
                 }
                 rule_payloads.append(payload)
-                url_cache[url] = payload
 
             for payload in rule_payloads:
                 r_item = payload["config_item"]
@@ -324,7 +341,7 @@ async def main_async():
                     await sync_rule_to_profile(api_sem, auth_client, pid, pseud, payload, state)
 
             # --------------------------------------------------------------------------- #
-            # NEW: CSV ANALYTICS EXPORT (1-Hour Rolling Window)
+# NEW: CSV ANALYTICS EXPORT (1-Hour Rolling Window)
             # --------------------------------------------------------------------------- #
             ANALYTICS_CLUSTER = config.get("analytics_cluster")
             stats_cache = {pseud: {"total": 0, "blocked": 0} for pseud in active_profiles.keys()}
