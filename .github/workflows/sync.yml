@@ -1,8 +1,8 @@
 name: Control D Sync
 
 on:
-  schedule:
-    #- cron: '17 5 * * *'
+  # schedule:
+  #   - cron: '17 5 * * *'
   workflow_dispatch:
 
 jobs:
@@ -10,38 +10,37 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+        
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
+          
       - name: Install dependencies
         run: |
           pip install "httpx[http2]"
-
+          
       - name: Run Sync Script
         env:
-          TOKEN: ${{ secrets.CONTROLD_TOKEN }} 
+          TOKEN: ${{ secrets.CONTROLD_TOKEN }}
           GUEST: ${{ secrets.GUEST }}
           IOT: ${{ secrets.IOT }}
           MAIN: ${{ secrets.MAIN }}
           USER_I: ${{ secrets.USER_I }}
           USER_K: ${{ secrets.USER_K }}
         run: python main.py
-
+        
       - name: Commit and Push State
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
           # Ensures both the state tracker and the dashboard are committed
           git add state.json README.md
           
