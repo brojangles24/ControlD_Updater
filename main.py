@@ -63,9 +63,10 @@ def save_state(state: Dict):
         if os.path.exists(tmp_file):
             os.remove(tmp_file)
 
-def calculate_hash(combined_data: List[Dict], profile_rule: str) -> str:
-    # Hash the structure of all aggregated JSON sets combined
-    payload = {"data": combined_data, "profile_rule": profile_rule}
+def calculate_hash(action_buckets: Dict, profile_rule: str) -> str:
+    # Hash post-filtered data states to track structural modifications explicitly
+    stable_buckets = {f"{k[0]}_{k[1]}": sorted(v) for k, v in action_buckets.items()}
+    payload = {"buckets": stable_buckets, "profile_rule": profile_rule}
     serialized = json.dumps(payload, sort_keys=True).encode('utf-8')
     return hashlib.sha256(serialized).hexdigest()
 
@@ -262,8 +263,12 @@ async def main_async():
                    httpx.AsyncClient(timeout=60, http2=True) as gh_client:
             
             api_sem = asyncio.Semaphore(5) 
-            rule_payloads = []
+            fetched_rules = []
+            explicit_blocks = set()
 
+            # ---------------------------------------------------------------- #
+            # PASS 1: Async Fetch Baseline & Accumulate Explicit Blocks
+            # ---------------------------------------------------------------- #
             for r_item in RULES_CONFIG:
                 raw_url_input = r_item.get("rule_url")
                 rule_name = r_item.get("rule", "Unnamed Rule")
@@ -272,11 +277,9 @@ async def main_async():
                 if not raw_url_input:
                     continue
 
-                # Normalize single strings into an array so iteration always works
                 urls = [raw_url_input] if isinstance(raw_url_input, str) else raw_url_input
 
                 combined_raw_rules = []
-                combined_jsons_for_hash = []
                 fallback_folder_name = "Unnamed Folder"
                 fetch_failed = False
 
@@ -284,9 +287,6 @@ async def main_async():
                     log.info(f"📥 Fetching blocklist source for: {rule_name} -> {url}")
                     try:
                         parsed_json = await fetch_gh_json(gh_client, url)
-                        combined_jsons_for_hash.append(parsed_json)
-                        
-                        # Accumulate rules across files
                         combined_raw_rules.extend(parsed_json.get("rules", []))
                         
                         if "group" in parsed_json and "group" in parsed_json["group"]:
@@ -294,22 +294,53 @@ async def main_async():
                     except Exception as e:
                         log.error(f"❌ Failed to fetch dataset from source URL {url}: {e}")
                         fetch_failed = True
-                        break # Abort this specific rule sync if any internal URL chunks fail
+                        break 
 
                 if fetch_failed or not combined_raw_rules:
                     continue
 
+                # Map out full list of explicitly blocked domains globally first
+                if profile_rule == "block":
+                    for rule in combined_raw_rules:
+                        hostname = rule.get("PK")
+                        if hostname:
+                            explicit_blocks.add(hostname.strip().lower())
+
+                fetched_rules.append({
+                    "r_item": r_item,
+                    "profile_rule": profile_rule,
+                    "combined_raw_rules": combined_raw_rules,
+                    "fallback_folder_name": fallback_folder_name
+                })
+
+            # ---------------------------------------------------------------- #
+            # PASS 2: Structural Verification and Allowlist Cross-Checking
+            # ---------------------------------------------------------------- #
+            rule_payloads = []
+            for item in fetched_rules:
+                r_item = item["r_item"]
+                profile_rule = item["profile_rule"]
+                combined_raw_rules = item["combined_raw_rules"]
+                fallback_folder_name = item["fallback_folder_name"]
+
                 folder_display_name = r_item.get("rule", fallback_folder_name).strip()
                 action_buckets = {}
+                final_rules_count = 0
 
                 for rule in combined_raw_rules:
                     hostname = rule.get("PK")
                     if not hostname:
                         continue
                     
+                    normalized_host = hostname.strip().lower()
+                    
                     if profile_rule == "block":
                         do, status = 0, 1
                     elif profile_rule == "allow":
+                        # Explicit Block Intersection Filtering Rule
+                        if normalized_host in explicit_blocks:
+                            log.warning(f"⚠️ [{folder_display_name}] Dropping allowed domain '{hostname}' due to explicit block collision.")
+                            continue
                         do, status = 1, 1
                     else:
                         r_action = rule.get("action", {})
@@ -318,12 +349,17 @@ async def main_async():
 
                     key = (do, status)
                     action_buckets.setdefault(key, []).append(hostname)
+                    final_rules_count += 1
+
+                if not action_buckets:
+                    log.info(f"⏩ [{folder_display_name}] Empty dataset after processing. Skipping payload.")
+                    continue
 
                 payload = {
                     "config_item": r_item,
                     "name": folder_display_name,
-                    "hash": calculate_hash(combined_jsons_for_hash, profile_rule),
-                    "rule_count": len(combined_raw_rules),
+                    "hash": calculate_hash(action_buckets, profile_rule),
+                    "rule_count": final_rules_count,
                     "action_buckets": action_buckets
                 }
                 rule_payloads.append(payload)
@@ -341,7 +377,7 @@ async def main_async():
                     await sync_rule_to_profile(api_sem, auth_client, pid, pseud, payload, state)
 
             # --------------------------------------------------------------------------- #
-# NEW: CSV ANALYTICS EXPORT (1-Hour Rolling Window)
+            # NEW: CSV ANALYTICS EXPORT (1-Hour Rolling Window)
             # --------------------------------------------------------------------------- #
             ANALYTICS_CLUSTER = config.get("analytics_cluster")
             stats_cache = {pseud: {"total": 0, "blocked": 0} for pseud in active_profiles.keys()}
