@@ -64,7 +64,6 @@ def save_state(state: Dict):
             os.remove(tmp_file)
 
 def calculate_hash(action_buckets: Dict, profile_rule: str) -> str:
-    # Hash post-filtered data states to track structural modifications explicitly
     stable_buckets = {f"{k[0]}_{k[1]}": sorted(v) for k, v in action_buckets.items()}
     payload = {"buckets": stable_buckets, "profile_rule": profile_rule}
     serialized = json.dumps(payload, sort_keys=True).encode('utf-8')
@@ -255,7 +254,7 @@ async def main_async():
     active_profiles = {k: v for k, v in env_profiles.items() if v}
 
     if not RULES_CONFIG:
-        log.info("⏩ No rules configured inside config.toml.")
+        log.info("⏩ No rules configured. Skipping sync.")
         return
 
     try:
@@ -264,10 +263,26 @@ async def main_async():
             
             api_sem = asyncio.Semaphore(5) 
             fetched_rules = []
-            explicit_blocks = set()
+            nsfw_blocks = set()
+
+            # --- FETCH BACKGROUND RAW TEXT NSFW LIST FOR FILTERING ONLY ---
+            nsfw_url = "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/nsfw-onlydomains.txt"
+            log.info(f"📥 Fetching background NSFW text list for cross-referencing...")
+            try:
+                resp = await gh_client.get(nsfw_url)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    # Ignore comments and empty lines
+                    if line and not line.startswith(('#', '!', '/')):
+                        nsfw_blocks.add(line.lower())
+                log.info(f"✅ Loaded {len(nsfw_blocks):,} domains from NSFW background list.")
+            except Exception as e:
+                log.error(f"❌ Failed to fetch background NSFW list: {e}")
+            # --------------------------------------------------------------
 
             # ---------------------------------------------------------------- #
-            # PASS 1: Async Fetch Baseline & Accumulate Explicit Blocks
+            # PASS 1: Async Fetch Baseline for ControlD Configured Rules
             # ---------------------------------------------------------------- #
             for r_item in RULES_CONFIG:
                 raw_url_input = r_item.get("rule_url")
@@ -278,7 +293,6 @@ async def main_async():
                     continue
 
                 urls = [raw_url_input] if isinstance(raw_url_input, str) else raw_url_input
-
                 combined_raw_rules = []
                 fallback_folder_name = "Unnamed Folder"
                 fetch_failed = False
@@ -299,13 +313,6 @@ async def main_async():
                 if fetch_failed or not combined_raw_rules:
                     continue
 
-                # Map out full list of explicitly blocked domains globally first
-                if profile_rule == "block":
-                    for rule in combined_raw_rules:
-                        hostname = rule.get("PK")
-                        if hostname:
-                            explicit_blocks.add(hostname.strip().lower())
-
                 fetched_rules.append({
                     "r_item": r_item,
                     "profile_rule": profile_rule,
@@ -314,7 +321,7 @@ async def main_async():
                 })
 
             # ---------------------------------------------------------------- #
-            # PASS 2: Structural Verification and Allowlist Cross-Checking
+            # PASS 2: Structural Verification and Dynamic Cross-Checking
             # ---------------------------------------------------------------- #
             rule_payloads = []
             for item in fetched_rules:
@@ -334,18 +341,14 @@ async def main_async():
                     
                     normalized_host = hostname.strip().lower()
                     
-                    if profile_rule == "block":
-                        do, status = 0, 1
-                    elif profile_rule == "allow":
-                        # Explicit Block Intersection Filtering Rule
-                        if normalized_host in explicit_blocks:
-                            log.warning(f"⚠️ [{folder_display_name}] Dropping allowed domain '{hostname}' due to explicit block collision.")
-                            continue
-                        do, status = 1, 1
-                    else:
-                        r_action = rule.get("action", {})
-                        do = int(r_action.get("do", 0))
-                        status = int(r_action.get("status", 1))
+                    r_action = rule.get("action", {})
+                    do = int(r_action.get("do", 0))
+                    status = int(r_action.get("status", 1))
+
+                    # If this is an ALLOW rule (do == 1), check it against the raw text NSFW blocklist
+                    if do == 1 and normalized_host in nsfw_blocks:
+                        log.warning(f"⚠️ [{folder_display_name}] Dropping allowed domain '{hostname}' because it matches the NSFW blocklist.")
+                        continue
 
                     key = (do, status)
                     action_buckets.setdefault(key, []).append(hostname)
@@ -377,7 +380,7 @@ async def main_async():
                     await sync_rule_to_profile(api_sem, auth_client, pid, pseud, payload, state)
 
             # --------------------------------------------------------------------------- #
-            # NEW: CSV ANALYTICS EXPORT (1-Hour Rolling Window)
+            # CSV ANALYTICS EXPORT (1-Hour Rolling Window)
             # --------------------------------------------------------------------------- #
             ANALYTICS_CLUSTER = config.get("analytics_cluster")
             stats_cache = {pseud: {"total": 0, "blocked": 0} for pseud in active_profiles.keys()}
