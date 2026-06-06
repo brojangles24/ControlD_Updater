@@ -16,5 +16,6 @@ rule_url = [
 rule = "Badware Hoster"
 profile_rule = "none"
 excluded_profiles = ["iot", "guest", "user_k"]
-rule_url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/badware-hoster-folder.json"
+rule_url = [
+"https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/badware-hoster-folder.json"
 ]
