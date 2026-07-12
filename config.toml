@@ -13,10 +13,10 @@ rule_url = [
 "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/spam-idns-folder.json",
 ]
 
-#[[rules]]
-#rule = "Badware Hoster"
-#profile_rule = "block"
-#excluded_profiles = ["iot", "guest", "user_k"]
-#rule_url = [
-#"https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/badware-hoster-folder.json",
-#]
+[[rules]]
+rule = "Badware Hoster"
+profile_rule = "block"
+excluded_profiles = ["iot", "guest", "user_k"]
+rule_url = [
+"https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/controld/badware-hoster-folder.json",
+]
