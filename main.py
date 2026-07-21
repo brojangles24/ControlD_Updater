@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 import hashlib
-import yaml
+import tomllib
 import datetime
 import csv
 import io
@@ -12,7 +12,7 @@ from typing import Dict, List, Any
 import httpx
 
 # --------------------------------------------------------------------------- #
-# 0. Load Configuration from YAML
+# 0. Load Configuration from TOML
 # --------------------------------------------------------------------------- #
 logging.basicConfig(
     level=logging.INFO,
@@ -23,10 +23,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("control-d-sync")
 
 try:
-    with open("config.yaml", "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f) or {}
+    with open("config.toml", "rb") as f:
+        config = tomllib.load(f)
 except Exception as e:
-    log.error(f"❌ Critical error loading config.yaml: {e}")
+    log.error(f"❌ Critical error loading config.toml: {e}")
     exit(1)
 
 API_BASE = "https://api.controld.com"
@@ -118,7 +118,7 @@ async def push_rules(api_sem: asyncio.Semaphore, client: httpx.AsyncClient, prof
                 async with api_sem:
                     resp = await client.post(f"{API_BASE}/profiles/{profile_id}/rules", json=payload)
                 resp.raise_for_status()
-                return 
+                return  # Exit function immediately on successful batch
             except httpx.HTTPStatusError as e:
                 if is_first and e.response.status_code == 404:
                     await asyncio.sleep(1)
@@ -131,7 +131,7 @@ async def push_rules(api_sem: asyncio.Semaphore, client: httpx.AsyncClient, prof
                             raise e 
                     except Exception:
                         pass
-                    break  # Proceed to fallback
+                    break  # Fall back to single-hostname attempts
                 if attempt == max_attempts - 1:
                     raise e
                 await asyncio.sleep(1)
@@ -184,7 +184,7 @@ async def sync_rule_to_profile(api_sem: asyncio.Semaphore, auth_client: httpx.As
         return
     
     if current_rules + rule_count > RULE_LIMIT:
-        log.error(f"❌ [{name}] -> ({profile_pseudonym}) Sync aborted. Exceeds 10k limit.")
+        log.error(f"❌ [{name}] -> ({profile_pseudonym}) Sync aborted. Exceeds limit.")
         return
 
     temp_name = f"{name}_tmp"
@@ -263,7 +263,7 @@ async def main_async():
             fetched_rules = []
             nsfw_blocks = set()
 
-            # --- FETCH BACKGROUND RAW TEXT NSFW LIST FOR FILTERING ONLY ---
+            # --- FETCH BACKGROUND RAW TEXT LIST FOR FILTERING ONLY ---
             nsfw_urls = [
                 "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/nsfw-onlydomains.txt",
                 "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/anti.piracy-onlydomains.txt",
@@ -415,7 +415,7 @@ async def main_async():
                 except Exception as e:
                     log.error(f"❌ Failed to parse analytics CSV: {e}")
             else:
-                log.info("⏩ No 'analytics_cluster' defined in config.yaml. Skipping stats fetch.")
+                log.info("⏩ No 'analytics_cluster' defined in config.toml. Skipping stats fetch.")
 
     finally:
         save_state(state)
