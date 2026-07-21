@@ -25,7 +25,7 @@ jobs:
           
       - name: Install dependencies
         run: |
-          pip install "httpx[http2]"
+          pip install "httpx[http2]" pyyaml
           
       - name: Run Sync Script
         env:
