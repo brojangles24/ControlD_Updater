@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 import hashlib
-import tomllib
+import yaml
 import datetime
 import csv
 import io
@@ -12,7 +12,7 @@ from typing import Dict, List, Any
 import httpx
 
 # --------------------------------------------------------------------------- #
-# 0. Load Configuration from TOML
+# 0. Load Configuration from YAML
 # --------------------------------------------------------------------------- #
 logging.basicConfig(
     level=logging.INFO,
@@ -23,10 +23,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("control-d-sync")
 
 try:
-    with open("config.toml", "rb") as f:
-        config = tomllib.load(f)
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
 except Exception as e:
-    log.error(f"❌ Critical error loading config.toml: {e}")
+    log.error(f"❌ Critical error loading config.yaml: {e}")
     exit(1)
 
 API_BASE = "https://api.controld.com"
@@ -97,20 +97,14 @@ async def fetch_gh_json(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
     return resp.json()
 
 async def list_folders(sem: asyncio.Semaphore, client: httpx.AsyncClient, profile_id: str) -> Dict[str, str]:
-    try:
-        resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles/{profile_id}/groups"))
-        data = resp.json()
-        return {g["group"].strip(): g["PK"] for g in data.get("body", {}).get("groups", [])}
-    except Exception:
-        return {}
+    resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles/{profile_id}/groups"))
+    data = resp.json()
+    return {g["group"].strip(): g["PK"] for g in data.get("body", {}).get("groups", [])}
 
 async def get_rule_count(sem: asyncio.Semaphore, client: httpx.AsyncClient, profile_id: str) -> int:
-    try:
-        resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles/{profile_id}/rules"))
-        data = resp.json()
-        return len(data.get("body", {}).get("rules", []))
-    except Exception:
-        return 0
+    resp = await _retry_request(sem, lambda: client.get(f"{API_BASE}/profiles/{profile_id}/rules"))
+    data = resp.json()
+    return len(data.get("body", {}).get("rules", []))
 
 async def push_rules(api_sem: asyncio.Semaphore, client: httpx.AsyncClient, profile_id: str, folder_name: str, folder_id: str, do: int, status: int, hostnames: List[str]):
     batches = [hostnames[i:i + BATCH_SIZE] for i in range(0, len(hostnames), BATCH_SIZE)]
@@ -137,7 +131,7 @@ async def push_rules(api_sem: asyncio.Semaphore, client: httpx.AsyncClient, prof
                             raise e 
                     except Exception:
                         pass
-                    break
+                    break  # Proceed to fallback
                 if attempt == max_attempts - 1:
                     raise e
                 await asyncio.sleep(1)
@@ -175,8 +169,12 @@ async def sync_rule_to_profile(api_sem: asyncio.Semaphore, auth_client: httpx.As
 
     log.info(f"🔄 Processing [{name}] for profile: {profile_pseudonym}")
     
-    current_rules = await get_rule_count(api_sem, auth_client, profile_id)
-    current_folders = await list_folders(api_sem, auth_client, profile_id)
+    try:
+        current_rules = await get_rule_count(api_sem, auth_client, profile_id)
+        current_folders = await list_folders(api_sem, auth_client, profile_id)
+    except Exception as e:
+        log.error(f"❌ Could not verify current profile status for {profile_pseudonym}: {e}. Aborting sync.")
+        return
     
     if profile_pseudonym not in state:
         state[profile_pseudonym] = {}
@@ -261,24 +259,27 @@ async def main_async():
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60, http2=True) as auth_client, \
                    httpx.AsyncClient(timeout=60, http2=True) as gh_client:
             
-            api_sem = asyncio.Semaphore(5) 
+            api_sem = asyncio.Semaphore(CONCURRENCY_LIMIT) 
             fetched_rules = []
             nsfw_blocks = set()
 
             # --- FETCH BACKGROUND RAW TEXT NSFW LIST FOR FILTERING ONLY ---
-            nsfw_url = "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/nsfw-onlydomains.txt"
-            log.info(f"📥 Fetching background NSFW text list for cross-referencing...")
-            try:
-                resp = await gh_client.get(nsfw_url)
-                resp.raise_for_status()
-                for line in resp.text.splitlines():
-                    line = line.strip()
-                    # Ignore comments and empty lines
-                    if line and not line.startswith(('#', '!', '/')):
-                        nsfw_blocks.add(line.lower())
-                log.info(f"✅ Loaded {len(nsfw_blocks):,} domains from NSFW background list.")
-            except Exception as e:
-                log.error(f"❌ Failed to fetch background NSFW list: {e}")
+            nsfw_urls = [
+                "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/nsfw-onlydomains.txt",
+                "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/anti.piracy-onlydomains.txt",
+            ]
+            log.info("📥 Fetching background text lists for cross-referencing...")
+            for url in nsfw_urls:
+                try:
+                    resp = await gh_client.get(url)
+                    resp.raise_for_status()
+                    for line in resp.text.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith(('#', '!', '/')):
+                            nsfw_blocks.add(line.lower())
+                except Exception as e:
+                    log.error(f"❌ Failed to fetch background list from {url}: {e}")
+            log.info(f"✅ Loaded {len(nsfw_blocks):,} domains from background list.")
             # --------------------------------------------------------------
 
             # ---------------------------------------------------------------- #
@@ -345,7 +346,6 @@ async def main_async():
                     do = int(r_action.get("do", 0))
                     status = int(r_action.get("status", 1))
 
-                    # If this is an ALLOW rule (do == 1), check it against the raw text NSFW blocklist
                     if do == 1 and normalized_host in nsfw_blocks:
                         log.warning(f"⚠️ [{folder_display_name}] Dropping allowed domain '{hostname}' because it matches the NSFW blocklist.")
                         continue
@@ -415,7 +415,7 @@ async def main_async():
                 except Exception as e:
                     log.error(f"❌ Failed to parse analytics CSV: {e}")
             else:
-                log.info("⏩ No 'analytics_cluster' defined in config.toml. Skipping stats fetch.")
+                log.info("⏩ No 'analytics_cluster' defined in config.yaml. Skipping stats fetch.")
 
     finally:
         save_state(state)
