@@ -267,6 +267,8 @@ async def main_async():
             nsfw_urls = [
                 "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/nsfw-onlydomains.txt",
                 "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/anti.piracy-onlydomains.txt",
+                "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/social-onlydomains.txt",
+                "https://raw.githubusercontent.com/sjhgvr/oisd/refs/heads/main/domainswild_nsfw.txt",
             ]
             log.info("📥 Fetching background text lists for cross-referencing...")
             for url in nsfw_urls:
